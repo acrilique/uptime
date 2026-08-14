@@ -4,6 +4,10 @@ const zdt = @import("zdt");
 const uptime = @import("uptime");
 
 pub fn main(init: std.process.Init) !void {
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
     const desc =
         \\This program takes a file containing an uptime log (e.g.:
         \\        2026-07-24 23:58:34 HEARTBEAT UP
@@ -50,10 +54,11 @@ pub fn main(init: std.process.Init) !void {
     defer res.deinit();
 
     if (res.args.help != 0) {
-        std.debug.print(desc, .{});
+        try stdout.print(desc, .{});
+        try stdout.flush();
         return clap.helpToFile(
             init.io,
-            .stderr(),
+            .stdout(),
             clap.Help,
             &params,
             .{},
@@ -62,58 +67,77 @@ pub fn main(init: std.process.Init) !void {
 
     const logfile = if (res.positionals[0]) |l| l else {
         std.debug.print("Missing log file path argument.\nUsage: ", .{});
-        return clap.usageToFile(
+        try clap.usageToFile(
             init.io,
             .stderr(),
             clap.Help,
             &params,
         );
+        return error.MissingLogFile;
     };
 
     const start = if (res.args.start) |s|
-        zdt.Datetime.fromISO8601(s) catch
-            return error.StartParseError
+        zdt.Datetime.fromISO8601(s) catch {
+            std.debug.print("Error parsing `--start` argument. ISO8601 format is expected.\n", .{});
+            return error.ParseError;
+        }
     else
         null;
 
     const end = if (res.args.end) |e|
-        zdt.Datetime.fromISO8601(e) catch
-            return error.EndParseError
+        zdt.Datetime.fromISO8601(e) catch {
+            std.debug.print("Error parsing `--end` argument. ISO8601 format is expected.\n", .{});
+            return error.ParseError;
+        }
     else
         null;
 
     const threshold = if (res.args.threshold) |t| t else 35.0;
 
+    if (!std.math.isFinite(threshold) or threshold <= 0) {
+        std.debug.print("Invalid threshold value: {d}\n", .{threshold});
+        return error.InvalidArgumentValue;
+    }
+
     const duration = if (res.args.duration) |d|
-        zdt.Duration.fromISO8601(d) catch
-            return error.DurationParseError
+        zdt.Duration.fromISO8601(d) catch {
+            std.debug.print("Error parsing `--duration` argument. ISO8601 format is expected.\n", .{});
+            return error.ParseError;
+        }
     else
         null;
 
-    var events = try uptime.parseFile(
+    var events = uptime.parseFile(
         init.io,
         init.gpa,
         logfile,
-    );
+    ) catch |e| {
+        std.debug.print("Error parsing log file: {s}\n", .{@errorName(e)});
+        return e;
+    };
     defer events.deinit(init.gpa);
 
-    const result = try uptime.analyze(
+    const result = uptime.analyze(
         events,
         start,
         end,
         zdt.Duration.fromTimespanMultiple(
-            @intFromFloat(threshold),
-            .minute,
+            @intFromFloat(threshold * 60),
+            .second,
         ),
         duration,
-    );
+    ) catch |e| {
+        std.debug.print("Error during analysis: {s}\n", .{@errorName(e)});
+        return e;
+    };
 
-    std.debug.print(
+    try stdout.print(
         \\Period:     {f} → {f}  ({f})
         \\Uptime:     {d:.2}%
         \\Confidence: {d:.2}%  ({f} observed / {f} period)
         \\Downtime:   {f}  across {d} outage{s}
         \\Lost time:  {f}  (no heartbeat within {d} min)
+        \\
     ,
         .{
             result.window_start,
@@ -130,4 +154,5 @@ pub fn main(init: std.process.Init) !void {
             threshold,
         },
     );
+    try stdout.flush();
 }

@@ -46,14 +46,16 @@ pub fn parseLine(line: []const u8) !?Event {
     const ts =
         zdt.Datetime.fromString(combined, "%Y-%m-%d %H:%M:%S") catch return null;
 
-    var state: []const u8 = undefined;
+    var state: ?[]const u8 = null;
     while (it.next()) |token|
         state = token;
 
-    if (std.mem.eql(u8, state, "UP")) {
-        return Event{ .ts = ts, .state = true };
-    } else if (std.mem.eql(u8, state, "DOWN")) {
-        return Event{ .ts = ts, .state = false };
+    if (state) |s| {
+        if (std.mem.eql(u8, s, "UP")) {
+            return Event{ .ts = ts, .state = true };
+        } else if (std.mem.eql(u8, s, "DOWN")) {
+            return Event{ .ts = ts, .state = false };
+        } else return null;
     } else return null;
 }
 
@@ -158,7 +160,7 @@ pub fn analyze(
     var uptime: zdt.Duration = zdt.Duration{ .__nsec = 0, .__sec = 0 };
     var downtime: zdt.Duration = zdt.Duration{ .__nsec = 0, .__sec = 0 };
     var outage_count: u32 = 0;
-    var prev_state: bool = undefined;
+    var prev_state: ?bool = null;
 
     for (events.items, 0..) |event, index| {
         const next_ts = if ((index + 1) < events.items.len)
@@ -192,7 +194,7 @@ pub fn analyze(
                 uptime = try uptime.add(observed)
             else {
                 downtime = try downtime.add(observed);
-                if (prev_state != false) outage_count += 1;
+                if (prev_state orelse true) outage_count += 1;
             }
         }
 
