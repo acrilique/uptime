@@ -83,6 +83,10 @@ pub fn parseFile(
         if (ev) |e| try events.append(allocator, e);
     }
 
+    if (events.items.len > 1)
+        for (events.items[1..]) |ev|
+            if (ev.ts.isAware() != events.items[0].ts.isAware()) return error.MixedNaiveAwareEvents;
+
     std.mem.sort(Event, events.items, {}, eventLessThan);
 
     return events;

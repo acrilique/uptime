@@ -127,7 +127,10 @@ pub fn main(init: std.process.Init) !void {
         ),
         duration,
     ) catch |e| {
-        std.debug.print("Error during analysis: {s}\n", .{@errorName(e)});
+        if (e == error.CompareNaiveAware)
+            reportMixedAwareness(logfile, events.items, start, end)
+        else
+            std.debug.print("Error during analysis: {s}\n", .{@errorName(e)});
         return e;
     };
 
@@ -155,4 +158,27 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     try stdout.flush();
+}
+
+/// Name the window bound(s) whose awareness differs from the log's.
+fn reportMixedAwareness(
+    logfile: []const u8,
+    events: []const uptime.Event,
+    start: ?zdt.Datetime,
+    end: ?zdt.Datetime,
+) void {
+    const log_aware = events[0].ts.isAware();
+    const other = if (log_aware) "naive" else "aware";
+    std.debug.print(
+        "Error during analysis: CompareNaiveAware: the log '{s}' has {s} timestamps, but\n",
+        .{ logfile, if (log_aware) "aware" else "naive" },
+    );
+    if (start) |s| if (s.isAware() != log_aware)
+        std.debug.print("  --start {f} is {s}\n", .{ s, other });
+    if (end) |e| if (e.isAware() != log_aware)
+        std.debug.print("  --end {f} is {s}\n", .{ e, other });
+    std.debug.print(
+        "Hint: {s}\n",
+        .{if (log_aware) "give --start/--end a UTC offset (Z, +02:00)" else "drop the UTC offset from --start/--end"},
+    );
 }
