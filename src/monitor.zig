@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Lluc Simó Margalef
+//
+// SPDX-License-Identifier: MIT
+
 const std = @import("std");
 const clap = @import("clap");
 const zdt = @import("zdt");
-const logfile = @import("logfile");
+const uptime = @import("uptime");
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [1024]u8 = undefined;
@@ -114,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     if (new_log) |f| {
         defer f.close(init.io);
         var line_buf: [64]u8 = undefined;
-        const line = try logfile.formatLine(
+        const line = try uptime.formatLine(
             &line_buf,
             zdt.Datetime.nowUTC(init.io),
             "MONITOR STARTED",
@@ -158,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const known = logfile.lastKnown(tail);
+    const known = uptime.lastKnown(tail);
     if (known.naive) {
         std.log.err(
             "The log '{s}' contains naive timestamps (no UTC offset), but the monitor logs aware ones (e.g. 2026-08-01T10:00:00Z); mixing the two makes the log unanalyzable. Fix the timestamps or move the log away and let the monitor start a fresh one.",
@@ -179,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
     var pos = log_len;
     if (current_state != last_state) {
         var line_buf: [64]u8 = undefined;
-        const line = try logfile.formatLine(
+        const line = try uptime.formatLine(
             &line_buf,
             now,
             if (current_state) "UP" else "DOWN",
@@ -192,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
         (now.diff(known.heartbeat.?).asSeconds() >= heartbeat_interval))
     {
         var line_buf: [64]u8 = undefined;
-        const line = try logfile.formatLine(
+        const line = try uptime.formatLine(
             &line_buf,
             now,
             if (current_state) "HEARTBEAT UP" else "HEARTBEAT DOWN",
