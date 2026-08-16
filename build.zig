@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     const clap = b.dependency("clap", .{});
     const zdt = b.dependency("zdt", .{});
 
-    const uptime = b.createModule(.{
+    const uptime = b.addModule("uptime", .{
         .root_source_file = b.path("src/uptime.zig"),
         .target = target,
         .optimize = optimize,
