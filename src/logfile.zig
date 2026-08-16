@@ -68,18 +68,22 @@ pub const LastKnown = struct {
     state: ?bool,
     /// Timestamp of the last HEARTBEAT line; null if there is none.
     heartbeat: ?zdt.Datetime,
+    /// True if any state-bearing line carried a naive timestamp. The monitor
+    /// refuses such logs instead of making them mixed naive/aware.
+    naive: bool,
 };
 
 /// Extract the last known state and the last heartbeat timestamp from log
 /// data, normally the tail of the log file. Malformed lines are ignored
 pub fn lastKnown(data: []const u8) LastKnown {
-    var known: LastKnown = .{ .state = null, .heartbeat = null };
+    var known: LastKnown = .{ .state = null, .heartbeat = null, .naive = false };
     var it = std.mem.tokenizeScalar(u8, data, '\n');
     while (it.next()) |line| {
         const event = parseLine(line) catch continue;
         if (event) |e| {
             known.state = e.state;
             if (e.heartbeat) known.heartbeat = e.ts;
+            if (e.ts.isNaive()) known.naive = true;
         }
     }
     return known;
@@ -145,10 +149,20 @@ test "lastKnown: recovers state and heartbeat" {
         \\
     );
     try std.testing.expect(known.state != null and known.state.?);
+    try std.testing.expect(!known.naive);
     try std.testing.expectEqual(
         try zdt.Datetime.fromISO8601("2026-08-01T10:30:00Z"),
         known.heartbeat.?,
     );
+}
+
+test "lastKnown: flags naive timestamps" {
+    const known = lastKnown(
+        \\2026-08-01T10:00:00 HEARTBEAT UP
+        \\2026-08-01T11:00:00 DOWN
+    );
+    try std.testing.expect(known.naive);
+    try std.testing.expect(known.state != null and !known.state.?);
 }
 
 test "lastKnown: transition after heartbeat updates state only" {

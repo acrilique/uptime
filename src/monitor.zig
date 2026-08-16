@@ -5,7 +5,8 @@ const logfile = @import("logfile");
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer =
+        std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     const desc =
@@ -66,7 +67,8 @@ pub fn main(init: std.process.Init) !void {
     const log_path = if (res.positionals[0]) |l| l else {
         std.log.err("Missing log file path argument.\nUsage:", .{});
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        var stderr_writer =
+            std.Io.File.stderr().writer(init.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
         try clap.usage(stderr, clap.Help, &params);
         try stderr.writeAll("\n");
@@ -124,13 +126,13 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.Dir.openFileAbsolute(
             init.io,
             log_path,
-            .{ .mode = .read_write },
+            .{ .mode = .read_write, .lock = .exclusive },
         )
     else
         try std.Io.Dir.cwd().openFile(
             init.io,
             log_path,
-            .{ .mode = .read_write },
+            .{ .mode = .read_write, .lock = .exclusive },
         );
     defer log.close(init.io);
 
@@ -145,7 +147,25 @@ pub fn main(init: std.process.Init) !void {
         log_len - tail_len,
     );
 
-    const known = logfile.lastKnown(tail_buf[0..@intCast(tail_len)]);
+    var tail = tail_buf[0..@intCast(tail_len)];
+    if (log_len > tail_buf.len) {
+        // the tail starts mid-line; that first line is partial and must not
+        // be parsed (a cut inside a state token would be misread or dropped)
+        if (std.mem.indexOfScalar(u8, tail, '\n')) |first_nl| {
+            tail = tail[first_nl + 1 ..];
+        } else {
+            tail = tail[tail.len..]; // no newline: the whole tail is one partial line
+        }
+    }
+
+    const known = logfile.lastKnown(tail);
+    if (known.naive) {
+        std.log.err(
+            "The log '{s}' contains naive timestamps (no UTC offset), but the monitor logs aware ones (e.g. 2026-08-01T10:00:00Z); mixing the two makes the log unanalyzable. Fix the timestamps or move the log away and let the monitor start a fresh one.",
+            .{log_path},
+        );
+        return error.NaiveLogFile;
+    }
     const last_state = known.state orelse true; // no state logged yet: assume UP
 
     const current_state: bool = try dnsProbeWithRetries(
@@ -183,7 +203,12 @@ pub fn main(init: std.process.Init) !void {
 
 /// Retries a failed probe `retries` times before giving up, so a single
 /// lost reply doesn't get logged as downtime
-fn dnsProbeWithRetries(io: std.Io, host: []const u8, timeout_s: u32, retries: u32) !bool {
+fn dnsProbeWithRetries(
+    io: std.Io,
+    host: []const u8,
+    timeout_s: u32,
+    retries: u32,
+) !bool {
     var remaining = retries;
     while (true) {
         if (try dnsProbe(io, host, timeout_s)) return true;
@@ -192,8 +217,8 @@ fn dnsProbeWithRetries(io: std.Io, host: []const u8, timeout_s: u32, retries: u3
     }
 }
 
-/// Sends a DNS query to `host` and waits up to `timeout_s` seconds for any
-/// reply
+/// Sends a DNS query to `host` and waits up to `timeout_s` seconds for a
+/// reply from the same server whose DNS id matches the query.
 fn dnsProbe(io: std.Io, host: []const u8, timeout_s: u32) !bool {
     const any: std.Io.net.IpAddress =
         .{ .ip4 = try std.Io.net.Ip4Address.parse("0.0.0.0", 0) };
@@ -217,15 +242,27 @@ fn dnsProbe(io: std.Io, host: []const u8, timeout_s: u32) !bool {
     };
     sock.send(io, &dest, &query) catch return false;
 
-    var buf: [512]u8 = undefined;
-    _ = sock.receiveTimeout(io, &buf, .{
+    const timeout: std.Io.Timeout = .{
         .duration = .{
             .raw = std.Io.Duration.fromSeconds(timeout_s),
             .clock = .awake,
         },
-    }) catch |err| switch (err) {
-        error.Timeout => return false,
-        else => return err,
     };
-    return true;
+    const deadline = timeout.toDeadline(io);
+
+    var buf: [512]u8 = undefined;
+    while (true) {
+        const msg = sock.receiveTimeout(
+            io,
+            &buf,
+            deadline,
+        ) catch |err|
+            switch (err) {
+                error.Timeout => return false,
+                else => return err,
+            };
+        if (msg.from.eql(&dest) and
+            msg.data.len >= 2 and
+            std.mem.eql(u8, msg.data[0..2], query[0..2])) return true;
+    }
 }

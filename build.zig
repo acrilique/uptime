@@ -17,19 +17,21 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zdt", .module = zdt.module("zdt") },
+            .{ .name = "clap", .module = clap.module("clap") },
+            .{ .name = "logfile", .module = logfile },
+        },
+        .link_libc = true,
+    });
+
     const parser = b.addExecutable(.{
         .name = "uptime-parser",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/parser.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zdt", .module = zdt.module("zdt") },
-                .{ .name = "clap", .module = clap.module("clap") },
-                .{ .name = "logfile", .module = logfile },
-            },
-            .link_libc = true,
-        }),
+        .root_module = parser_mod,
     });
 
     const monitor = b.addExecutable(.{
@@ -79,4 +81,16 @@ pub fn build(b: *std.Build) void {
     const run_logfile_tests = b.addRunArtifact(logfile_tests);
     const logfile_test_step = b.step("test-logfile", "Run logfile tests");
     logfile_test_step.dependOn(&run_logfile_tests.step);
+
+    const parser_tests = b.addTest(.{
+        .root_module = parser_mod,
+    });
+
+    const run_parser_tests = b.addRunArtifact(parser_tests);
+    const parser_test_step = b.step("test-parser", "Run parser tests");
+    parser_test_step.dependOn(&run_parser_tests.step);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(logfile_test_step);
+    test_step.dependOn(parser_test_step);
 }

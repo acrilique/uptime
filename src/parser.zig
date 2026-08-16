@@ -47,10 +47,13 @@ pub fn parseFile(
         if (ev) |e| try events.append(allocator, e);
     }
 
-    if (events.items.len > 1)
-        for (events.items[1..]) |ev|
-            if (ev.ts.isAware() != events.items[0].ts.isAware())
+    if (events.items.len > 1) {
+        const first_is_aware = events.items[0].ts.isAware();
+        for (events.items[1..]) |ev| {
+            if (ev.ts.isAware() != first_is_aware)
                 return error.MixedNaiveAwareEvents;
+        }
+    }
 
     std.mem.sort(Event, events.items, {}, eventLessThan);
 
@@ -66,6 +69,8 @@ pub const Result = struct {
     observed_time: zdt.Duration,
     lost_time: zdt.Duration,
     window_length: zdt.Duration,
+    /// Observed outages: each transition into DOWN within the window,
+    /// including one already in progress when the window opens.
     outage_count: u32,
 
     pub fn uptime_pct(self: Result) f32 {
@@ -133,7 +138,7 @@ pub fn analyze(
     var uptime: zdt.Duration = .{};
     var downtime: zdt.Duration = .{};
     var outage_count: u32 = 0;
-    var prev_state: ?bool = null;
+    var last_observed: ?bool = null;
 
     for (events.items, 0..) |event, index| {
         const next_ts = if ((index + 1) < events.items.len)
@@ -163,15 +168,16 @@ pub fn analyze(
 
         if (try zdt.Datetime.compareUT(interval_end, interval_start) == .gt) {
             const observed = interval_end.diff(interval_start);
-            if (event.state)
-                uptime = try uptime.add(observed)
-            else {
+            if (event.state) {
+                uptime = try uptime.add(observed);
+            } else {
                 downtime = try downtime.add(observed);
-                if (prev_state orelse true) outage_count += 1;
+                // null means nothing was observed before it: the outage was
+                // already in progress when the window opened
+                if (last_observed orelse true) outage_count += 1;
             }
+            last_observed = event.state;
         }
-
-        prev_state = event.state;
     }
 
     const observed_time = try uptime.add(downtime);
@@ -384,4 +390,76 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     try stdout.flush();
+}
+
+const testing = std.testing;
+
+fn testEvent(ts: []const u8, up: bool) !Event {
+    return .{
+        .ts = try logfile.canonicalTs(try zdt.Datetime.fromISO8601(ts)),
+        .state = up,
+        .heartbeat = false,
+    };
+}
+
+fn testThreshold() zdt.Duration {
+    return zdt.Duration.fromTimespanMultiple(35, .minute);
+}
+
+test "analyze: outage already in progress at the start is counted" {
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    // a monitor transition run appends DOWN and HEARTBEAT DOWN with one
+    // timestamp, so the run's onset carries a zero-length interval
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:00:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:00:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:01:00Z", false));
+
+    const result = try analyze(events, null, null, testThreshold(), null);
+    try testing.expectEqual(@as(u32, 1), result.outage_count);
+    try testing.expectEqual(@as(i128, 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
+}
+
+test "analyze: each UP→DOWN transition is one outage" {
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:00:00Z", true));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:15:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:16:00Z", true));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:17:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:20:00Z", true));
+
+    const result = try analyze(events, null, null, testThreshold(), null);
+    try testing.expectEqual(@as(u32, 2), result.outage_count);
+    try testing.expectEqual(@as(i128, 4 * 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
+}
+
+test "analyze: outage entirely outside the window is not counted" {
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:00:00Z", true));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:15:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:20:00Z", true));
+
+    const start = try logfile.canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z"));
+    const end = try logfile.canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T13:00:00Z"));
+    const result = try analyze(events, start, end, testThreshold(), null);
+    try testing.expectEqual(@as(u32, 0), result.outage_count);
+    try testing.expectEqual(@as(i128, 0), result.down_time.asNanoseconds());
+}
+
+test "analyze: outage straddling the window start is counted" {
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:00:00Z", true));
+    try events.append(testing.allocator, try testEvent("2026-08-16T10:45:00Z", false));
+    try events.append(testing.allocator, try testEvent("2026-08-16T11:30:00Z", true));
+
+    // DOWN at 10:45 is observed until 11:20 (35 min threshold), so 20 of
+    // its minutes fall inside the window
+    const start = try logfile.canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T11:00:00Z"));
+    const end = try logfile.canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z"));
+    const result = try analyze(events, start, end, testThreshold(), null);
+    try testing.expectEqual(@as(u32, 1), result.outage_count);
+    try testing.expectEqual(@as(i128, 20 * 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
 }
