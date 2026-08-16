@@ -20,7 +20,8 @@ pub fn main(init: std.process.Init) !void {
         \\On each run, the current state is compared against the last logged
         \\one: a UP/DOWN line is appended on a transition, and a HEARTBEAT line
         \\whenever the last one is older than `--heartbeat-interval` seconds.
-        \\The log can then be analyzed with `uptime-parser`.
+        \\A failed probe is retried `--num-retries` times before it counts as
+        \\downtime. The log can then be analyzed with `uptime-parser`.
         \\
         \\
     ;
@@ -29,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
         \\-h, --help                      Display this help and exit.
         \\-t, --target <str>              DNS server to query (default: 8.8.8.8).
         \\    --timeout <u32>             Seconds to wait for a DNS reply (default: 2).
+        \\    --num-retries <u32>         Failed probe retries before reporting DOWN (default: 0).
         \\    --heartbeat-interval <u32>  Seconds between heartbeat log entries (default: 1800).
         \\<str>                           Path to the uptime log file.
     );
@@ -74,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
     const target = res.args.target orelse "8.8.8.8";
     const timeout = res.args.timeout orelse 2;
+    const num_retries = res.args.@"num-retries" orelse 0;
     const heartbeat_interval = res.args.@"heartbeat-interval" orelse 1800;
 
     if (timeout == 0) {
@@ -145,7 +148,12 @@ pub fn main(init: std.process.Init) !void {
     const known = logfile.lastKnown(tail_buf[0..@intCast(tail_len)]);
     const last_state = known.state orelse true; // no state logged yet: assume UP
 
-    const current_state: bool = try dnsProbe(init.io, target, timeout);
+    const current_state: bool = try dnsProbeWithRetries(
+        init.io,
+        target,
+        timeout,
+        num_retries,
+    );
     const now = zdt.Datetime.nowUTC(init.io);
 
     var pos = log_len;
@@ -170,6 +178,17 @@ pub fn main(init: std.process.Init) !void {
             if (current_state) "HEARTBEAT UP" else "HEARTBEAT DOWN",
         );
         try log.writePositionalAll(init.io, line, pos);
+    }
+}
+
+/// Retries a failed probe `retries` times before giving up, so a single
+/// lost reply doesn't get logged as downtime
+fn dnsProbeWithRetries(io: std.Io, host: []const u8, timeout_s: u32, retries: u32) !bool {
+    var remaining = retries;
+    while (true) {
+        if (try dnsProbe(io, host, timeout_s)) return true;
+        if (remaining == 0) return false;
+        remaining -= 1;
     }
 }
 
