@@ -23,7 +23,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zdt", .module = zdt.module("zdt") },
-            .{ .name = "clap", .module = clap.module("clap") },
             .{ .name = "logfile", .module = logfile },
         },
         .link_libc = true,
@@ -31,7 +30,17 @@ pub fn build(b: *std.Build) void {
 
     const parser = b.addExecutable(.{
         .name = "uptime-parser",
-        .root_module = parser_mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/parser-cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zdt", .module = zdt.module("zdt") },
+                .{ .name = "clap", .module = clap.module("clap") },
+                .{ .name = "parser", .module = parser_mod },
+            },
+            .link_libc = true,
+        }),
     });
 
     const monitor = b.addExecutable(.{
