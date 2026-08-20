@@ -180,6 +180,34 @@ pub const Result = struct {
     }
 };
 
+/// How the analysis window relates to the timespan covered by the log.
+const WindowCoverage = enum {
+    /// contained within the log's timespan
+    inside,
+    /// overlaps the timespan but sticks out on at least one end
+    partial,
+    /// no overlap with the timespan at all
+    outside,
+};
+
+/// Classify where the window [ws, we] sits with respect to the log's
+/// timespan [first_ts, last_ts]. A window touching an edge of the
+/// timespan counts as inside.
+fn windowCoverage(
+    ws: zdt.Datetime,
+    we: zdt.Datetime,
+    first_ts: zdt.Datetime,
+    last_ts: zdt.Datetime,
+) !WindowCoverage {
+    if ((try zdt.Datetime.compareUT(we, first_ts)) == .lt or
+        (try zdt.Datetime.compareUT(ws, last_ts)) == .gt)
+        return .outside;
+    if ((try zdt.Datetime.compareUT(ws, first_ts)) == .lt or
+        (try zdt.Datetime.compareUT(we, last_ts)) == .gt)
+        return .partial;
+    return .inside;
+}
+
 /// Analyze a list of events given a specific time span and threshold, and
 /// obtain a result containing the uptime percentage amongst other things.
 pub fn analyze(
@@ -224,6 +252,20 @@ pub fn analyze(
 
     if (try zdt.Datetime.compareUT(we, ws) == .lt)
         return error.MisorderedWindowBounds;
+
+    // Bounds derived from the log equal its edges exactly, so a window that
+    // reaches past the timespan can only come from caller-supplied bounds.
+    switch (try windowCoverage(ws, we, first_ts, last_ts)) {
+        .inside => {},
+        .partial => std.log.warn(
+            "Window {f} → {f} partially falls outside the log's timespan ({f} → {f})",
+            .{ ws, we, first_ts, last_ts },
+        ),
+        .outside => std.log.warn(
+            "Window {f} → {f} falls entirely outside the log's timespan ({f} → {f})",
+            .{ ws, we, first_ts, last_ts },
+        ),
+    }
 
     var uptime: zdt.Duration = .{};
     var downtime: zdt.Duration = .{};
@@ -453,6 +495,8 @@ test "analyze: outage entirely outside the window is not counted" {
     try events.append(std.testing.allocator, try testEvent("2026-08-16T10:00:00Z", true));
     try events.append(std.testing.allocator, try testEvent("2026-08-16T10:15:00Z", false));
     try events.append(std.testing.allocator, try testEvent("2026-08-16T10:20:00Z", true));
+    // extends the timespan so the window below stays inside it
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T13:30:00Z", true));
 
     const start = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z"));
     const end = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T13:00:00Z"));
@@ -467,6 +511,8 @@ test "analyze: outage straddling the window start is counted" {
     try events.append(std.testing.allocator, try testEvent("2026-08-16T10:00:00Z", true));
     try events.append(std.testing.allocator, try testEvent("2026-08-16T10:45:00Z", false));
     try events.append(std.testing.allocator, try testEvent("2026-08-16T11:30:00Z", true));
+    // extends the timespan so the window below stays inside it
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T12:30:00Z", true));
 
     // DOWN at 10:45 is observed until 11:20 (35 min threshold), so 20 of
     // its minutes fall inside the window
@@ -475,4 +521,83 @@ test "analyze: outage straddling the window start is counted" {
     const result = try analyze(events, start, end, testThreshold(), null);
     try std.testing.expectEqual(@as(u32, 1), result.outage_count);
     try std.testing.expectEqual(@as(i128, 20 * 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
+}
+
+fn testTs(ts: []const u8) !zdt.Datetime {
+    return canonicalTs(try zdt.Datetime.fromISO8601(ts));
+}
+
+test "windowCoverage: window within the timespan" {
+    const first = try testTs("2026-08-16T10:00:00Z");
+    const last = try testTs("2026-08-16T12:00:00Z");
+    // a window touching the edges is still inside
+    try std.testing.expectEqual(
+        WindowCoverage.inside,
+        try windowCoverage(first, last, first, last),
+    );
+    try std.testing.expectEqual(
+        WindowCoverage.inside,
+        try windowCoverage(
+            try testTs("2026-08-16T10:30:00Z"),
+            try testTs("2026-08-16T11:00:00Z"),
+            first,
+            last,
+        ),
+    );
+}
+
+test "windowCoverage: window sticking out of the timespan" {
+    const first = try testTs("2026-08-16T10:00:00Z");
+    const last = try testTs("2026-08-16T12:00:00Z");
+    try std.testing.expectEqual(
+        WindowCoverage.partial,
+        try windowCoverage(
+            try testTs("2026-08-16T09:00:00Z"),
+            last,
+            first,
+            last,
+        ),
+    );
+    try std.testing.expectEqual(
+        WindowCoverage.partial,
+        try windowCoverage(
+            first,
+            try testTs("2026-08-16T13:00:00Z"),
+            first,
+            last,
+        ),
+    );
+    // sticking out on both ends still counts as partial
+    try std.testing.expectEqual(
+        WindowCoverage.partial,
+        try windowCoverage(
+            try testTs("2026-08-16T09:00:00Z"),
+            try testTs("2026-08-16T13:00:00Z"),
+            first,
+            last,
+        ),
+    );
+}
+
+test "windowCoverage: window disjoint from the timespan" {
+    const first = try testTs("2026-08-16T10:00:00Z");
+    const last = try testTs("2026-08-16T12:00:00Z");
+    try std.testing.expectEqual(
+        WindowCoverage.outside,
+        try windowCoverage(
+            try testTs("2026-08-16T08:00:00Z"),
+            try testTs("2026-08-16T09:00:00Z"),
+            first,
+            last,
+        ),
+    );
+    try std.testing.expectEqual(
+        WindowCoverage.outside,
+        try windowCoverage(
+            try testTs("2026-08-16T13:00:00Z"),
+            try testTs("2026-08-16T14:00:00Z"),
+            first,
+            last,
+        ),
+    );
 }
