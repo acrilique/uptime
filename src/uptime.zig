@@ -20,13 +20,6 @@ pub const Event = struct {
     heartbeat: bool,
 };
 
-/// This is needed because zdt's Datetime.add/sub drop a plain utc_offset in
-/// version 0.9.4 of zdt. [Opened an issue.](https://codeberg.org/FObersteiner/zdt/issues/41)
-pub fn canonicalTs(ts: zdt.Datetime) !zdt.Datetime {
-    if (ts.isNaive()) return ts;
-    return ts.tzConvert(.{ .tz = &zdt.Timezone.UTC });
-}
-
 /// Parse one log line into an Event. Returns null for lines that carry no
 /// state to analyze (blank lines, comments, informational MONITOR entries);
 /// returns an error for lines that look like log entries but fail to parse.
@@ -44,9 +37,7 @@ pub fn parseLine(line: []const u8) !?Event {
     const ts_token = it.next().?; // trimmed_line is non-empty, so a token exists
     const command = it.next() orelse return error.MissingCommand;
 
-    const ts = canonicalTs(
-        zdt.Datetime.fromISO8601(ts_token) catch return error.BadTimestamp,
-    ) catch return error.BadTimestamp;
+    const ts = zdt.Datetime.fromISO8601(ts_token) catch return error.BadTimestamp;
 
     if (std.mem.eql(u8, command, "MONITOR")) return null;
 
@@ -333,14 +324,14 @@ pub fn analyze(
     };
 }
 
-/// Parse a --start/--end argument into its canonical timestamp form.
+/// Parse a --start/--end argument.
 pub fn parseBound(s: []const u8) !zdt.Datetime {
-    return canonicalTs(try zdt.Datetime.fromISO8601(s));
+    return zdt.Datetime.fromISO8601(s);
 }
 
 fn testEvent(ts: []const u8, up: bool) !Event {
     return .{
-        .ts = try canonicalTs(try zdt.Datetime.fromISO8601(ts)),
+        .ts = try zdt.Datetime.fromISO8601(ts),
         .state = up,
         .heartbeat = false,
     };
@@ -378,14 +369,14 @@ test "parseLine: malformed lines return errors" {
     try std.testing.expectError(error.UnknownState, parseLine("2026-08-01T11:00:00Z MAYBE"));
 }
 
-test "parseLine: offset timestamps are canonicalized to Z form" {
+test "parseLine: offset timestamps pass through unchanged" {
     const ev = try parseLine("2026-08-01T12:30:00+02:30 HEARTBEAT UP");
     try std.testing.expect(ev != null);
     try std.testing.expectEqual(
-        try zdt.Datetime.fromISO8601("2026-08-01T10:00:00Z"),
+        try zdt.Datetime.fromISO8601("2026-08-01T12:30:00+02:30"),
         ev.?.ts,
     );
-    // the whole point: arithmetic must not turn a canonical ts naive
+    // arithmetic must not turn an aware ts naive
     const later = try ev.?.ts.add(zdt.Duration.fromTimespanMultiple(60, .second));
     try std.testing.expect(later.isAware());
 }
@@ -498,8 +489,8 @@ test "analyze: outage entirely outside the window is not counted" {
     // extends the timespan so the window below stays inside it
     try events.append(std.testing.allocator, try testEvent("2026-08-16T13:30:00Z", true));
 
-    const start = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z"));
-    const end = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T13:00:00Z"));
+    const start = try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z");
+    const end = try zdt.Datetime.fromISO8601("2026-08-16T13:00:00Z");
     const result = try analyze(events, start, end, testThreshold(), null);
     try std.testing.expectEqual(@as(u32, 0), result.outage_count);
     try std.testing.expectEqual(@as(i128, 0), result.down_time.asNanoseconds());
@@ -516,15 +507,15 @@ test "analyze: outage straddling the window start is counted" {
 
     // DOWN at 10:45 is observed until 11:20 (35 min threshold), so 20 of
     // its minutes fall inside the window
-    const start = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T11:00:00Z"));
-    const end = try canonicalTs(try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z"));
+    const start = try zdt.Datetime.fromISO8601("2026-08-16T11:00:00Z");
+    const end = try zdt.Datetime.fromISO8601("2026-08-16T12:00:00Z");
     const result = try analyze(events, start, end, testThreshold(), null);
     try std.testing.expectEqual(@as(u32, 1), result.outage_count);
     try std.testing.expectEqual(@as(i128, 20 * 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
 }
 
 fn testTs(ts: []const u8) !zdt.Datetime {
-    return canonicalTs(try zdt.Datetime.fromISO8601(ts));
+    return zdt.Datetime.fromISO8601(ts);
 }
 
 test "windowCoverage: window within the timespan" {
