@@ -338,7 +338,7 @@ fn testEvent(ts: []const u8, up: bool) !Event {
 }
 
 fn testThreshold() zdt.Duration {
-    return zdt.Duration.fromTimespanMultiple(35, .minute);
+    return zdt.Duration.fromTimespanMultiple(35, .minute) catch unreachable;
 }
 
 test "parseLine: state events" {
@@ -377,7 +377,7 @@ test "parseLine: offset timestamps pass through unchanged" {
         ev.?.ts,
     );
     // arithmetic must not turn an aware ts naive
-    const later = try ev.?.ts.add(zdt.Duration.fromTimespanMultiple(60, .second));
+    const later = try ev.?.ts.add(zdt.Duration.fromTimespanMultiple(60, .second) catch unreachable);
     try std.testing.expect(later.isAware());
 }
 

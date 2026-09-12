@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
         events,
         start,
         end,
-        zdt.Duration.fromTimespanMultiple(
+        try zdt.Duration.fromTimespanMultiple(
             @intFromFloat(threshold_sec),
             .second,
         ),
