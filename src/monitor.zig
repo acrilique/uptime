@@ -260,14 +260,17 @@ fn dnsProbe(io: std.Io, host: []const u8, timeout_s: u32) !bool {
     );
     defer sock.close(io);
 
-    const query = [_]u8{
-        0x12, 0x34, // id
+    var query = [_]u8{
+        0x12, 0x34, // id: overwritten with a random value below
         0x01, 0x00, // flags: recursion desired
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // one question
         0x03, 'c', 'o', 'm', 0x00, // qname: com
         0x00, 0x01, // qtype: A
         0x00, 0x01, // qclass: IN
     };
+    // the transaction id is the only anti-spoofing secret in the exchange;
+    // it must be unpredictable per query or a forged reply can fabricate UP
+    std.Io.random(io, query[0..2]);
     sock.send(io, &dest, &query) catch return false;
 
     const timeout: std.Io.Timeout = .{
@@ -289,8 +292,119 @@ fn dnsProbe(io: std.Io, host: []const u8, timeout_s: u32) !bool {
                 error.Timeout => return false,
                 else => return err,
             };
-        if (msg.from.eql(&dest) and
-            msg.data.len >= 2 and
-            std.mem.eql(u8, msg.data[0..2], query[0..2])) return true;
+        if (msg.from.eql(&dest) and isValidReply(&query, msg.data)) return true;
     }
+}
+
+/// Check a DNS reply against the query sent: it must carry the same
+/// transaction id, be a well-formed response (QR set, rcode NOERROR, exactly
+/// one question) and echo the query's question section. Answer, authority
+/// and additional records may follow, so only the question is compared.
+fn isValidReply(query: []const u8, reply: []const u8) bool {
+    if (reply.len < 12) return false; // full header
+    if (!std.mem.eql(u8, reply[0..2], query[0..2])) return false;
+    const flags = std.mem.readInt(u16, reply[2..4], .big);
+    if (flags & 0x8000 == 0) return false; // QR: is a response
+    if (flags & 0x000F != 0) return false; // rcode: NOERROR
+    if (std.mem.readInt(u16, reply[4..6], .big) != 1) return false; // QDCOUNT
+    const question_len = query.len - 12;
+    if (reply.len < 12 + question_len) return false;
+    return std.mem.eql(u8, reply[12 .. 12 + question_len], query[12..]);
+}
+
+const testing = std.testing;
+
+const test_query = [_]u8{
+    0xab, 0xcd, // id
+    0x01, 0x00, // flags: recursion desired
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // one question
+    0x03, 'c', 'o', 'm', 0x00, // qname: com
+    0x00, 0x01, // qtype: A
+    0x00, 0x01, // qclass: IN
+};
+
+/// Build a reply: header with the given txid/flags/qdcount=1, optionally the
+/// question echoed from test_query, then an arbitrary trailer (e.g. answer
+/// records or a mismatched question).
+fn testReply(
+    buf: *[64]u8,
+    txid: u16,
+    flags: u16,
+    echo_question: bool,
+    trailer: []const u8,
+) []const u8 {
+    std.mem.writeInt(u16, buf[0..2], txid, .big);
+    std.mem.writeInt(u16, buf[2..4], flags, .big);
+    std.mem.writeInt(u16, buf[4..6], 1, .big); // QDCOUNT
+    @memset(buf[6..12], 0); // answer/authority/additional counts
+    var n: usize = 12;
+    if (echo_question) {
+        const question = test_query[12..];
+        @memcpy(buf[n .. n + question.len], question);
+        n += question.len;
+    }
+    @memcpy(buf[n .. n + trailer.len], trailer);
+    return buf[0 .. n + trailer.len];
+}
+
+test "isValidReply: accepts a well-formed reply echoing the question" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0xabcd, 0x8180, true, "");
+    try testing.expect(isValidReply(&test_query, reply));
+}
+
+test "isValidReply: accepts replies carrying answer records" {
+    var buf: [64]u8 = undefined;
+    // compressed name -> com, type A, class IN, ttl 60, rdlength 4, 8.8.8.8
+    const reply = testReply(&buf, 0xabcd, 0x8180, true, &.{
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+        8,    8,    8,    8,
+    });
+    try testing.expect(isValidReply(&test_query, reply));
+}
+
+test "isValidReply: accepts truncated replies (TC bit)" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0xabcd, 0x8280, true, "");
+    try testing.expect(isValidReply(&test_query, reply));
+}
+
+test "isValidReply: rejects junk carrying the right transaction id" {
+    try testing.expect(!isValidReply(&test_query, &.{ 0xab, 0xcd, 0xff }));
+}
+
+test "isValidReply: rejects a mismatched transaction id" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0x9999, 0x8180, true, "");
+    try testing.expect(!isValidReply(&test_query, reply));
+}
+
+test "isValidReply: rejects error rcodes (SERVFAIL)" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0xabcd, 0x8182, true, "");
+    try testing.expect(!isValidReply(&test_query, reply));
+}
+
+test "isValidReply: rejects packets that are not responses (QR clear)" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0xabcd, 0x0100, true, "");
+    try testing.expect(!isValidReply(&test_query, reply));
+}
+
+test "isValidReply: rejects a question section that doesn't echo the query" {
+    var buf: [64]u8 = undefined;
+    const reply = testReply(&buf, 0xabcd, 0x8180, false, &.{ 0x04, 'e', 'v', 'i', 'l', 0x00 });
+    try testing.expect(!isValidReply(&test_query, reply));
+}
+
+test "isValidReply: rejects an unexpected question count" {
+    const reply = [_]u8{
+        0xab, 0xcd, // id
+        0x81, 0x80, // flags: QR, RD, RA; NOERROR
+        0x00, 0x00, // QDCOUNT: 0
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+    };
+    try testing.expect(!isValidReply(&test_query, &reply));
 }

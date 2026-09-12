@@ -32,19 +32,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const monitor_module = b.createModule(.{
+        .root_source_file = b.path("src/monitor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zdt", .module = zdt.module("zdt") },
+            .{ .name = "clap", .module = clap.module("clap") },
+            .{ .name = "uptime", .module = uptime },
+        },
+        .link_libc = true,
+    });
+
     const monitor = b.addExecutable(.{
         .name = "uptime-monitor",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/monitor.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zdt", .module = zdt.module("zdt") },
-                .{ .name = "clap", .module = clap.module("clap") },
-                .{ .name = "uptime", .module = uptime },
-            },
-            .link_libc = true,
-        }),
+        .root_module = monitor_module,
     });
 
     b.installArtifact(parser);
@@ -78,6 +80,13 @@ pub fn build(b: *std.Build) void {
 
     const run_uptime_tests = b.addRunArtifact(uptime_tests);
 
+    const monitor_tests = b.addTest(.{
+        .root_module = monitor_module,
+    });
+
+    const run_monitor_tests = b.addRunArtifact(monitor_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_uptime_tests.step);
+    test_step.dependOn(&run_monitor_tests.step);
 }
