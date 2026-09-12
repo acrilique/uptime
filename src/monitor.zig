@@ -126,18 +126,29 @@ pub fn main(init: std.process.Init) !void {
         try f.writePositionalAll(init.io, line, 0);
     }
 
-    const log = if (std.fs.path.isAbsolute(log_path))
-        try std.Io.Dir.openFileAbsolute(
+    // don't follow a symlink at the log path: a privileged monitor (e.g. a
+    // root timer) must not append into a file chosen by whoever can plant a
+    // link in the log directory
+    const log = (if (std.fs.path.isAbsolute(log_path))
+        std.Io.Dir.openFileAbsolute(
             init.io,
             log_path,
-            .{ .mode = .read_write, .lock = .exclusive },
+            .{ .mode = .read_write, .lock = .exclusive, .follow_symlinks = false },
         )
     else
-        try std.Io.Dir.cwd().openFile(
+        std.Io.Dir.cwd().openFile(
             init.io,
             log_path,
-            .{ .mode = .read_write, .lock = .exclusive },
-        );
+            .{ .mode = .read_write, .lock = .exclusive, .follow_symlinks = false },
+        )) catch |err| {
+        if (err == error.SymLinkLoop) {
+            std.log.err(
+                "The log path '{s}' is a symbolic link. Refusing to follow it.",
+                .{log_path},
+            );
+        }
+        return err;
+    };
     defer log.close(init.io);
 
     // only the tail of the log is needed to find the last known state
