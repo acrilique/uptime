@@ -101,6 +101,8 @@ pub fn parseFile(
     path: []const u8,
 ) !std.ArrayList(Event) {
     var events: std.ArrayList(Event) = .empty;
+    // on error the caller gets no way to free the partially-built list
+    errdefer events.deinit(allocator);
 
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -450,6 +452,68 @@ test "formatLine: matches the parseable log format" {
     try std.testing.expect(!event.?.state);
     try std.testing.expect(event.?.heartbeat);
     try std.testing.expectEqual(ts, event.?.ts);
+}
+
+test "parseFile: parses a log into events sorted by timestamp" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile(testing.io, "uptime.log", .{});
+    defer f.close(testing.io);
+    try f.writePositionalAll(
+        testing.io,
+        "2026-08-16T10:10:00Z UP\n" ++
+            "2026-08-16T10:00:00Z DOWN\n" ++
+            "2026-08-16T10:05:00Z HEARTBEAT UP\n",
+        0,
+    );
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        ".zig-cache/tmp/{s}/uptime.log",
+        .{tmp.sub_path},
+    );
+
+    var events = try parseFile(testing.io, testing.allocator, path);
+    defer events.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), events.items.len);
+    try testing.expect(eventLessThan({}, events.items[0], events.items[1]));
+    try testing.expect(eventLessThan({}, events.items[1], events.items[2]));
+    try testing.expect(!events.items[0].state);
+    try testing.expect(events.items[1].heartbeat);
+    try testing.expect(events.items[2].state);
+}
+
+test "parseFile: error paths free the events allocation" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile(testing.io, "mixed.log", .{});
+    defer f.close(testing.io);
+    try f.writePositionalAll(
+        testing.io,
+        "2026-08-16T10:00:00Z UP\n" ++
+            "2026-08-16T10:05:00 DOWN\n" ++
+            "2026-08-16T10:10:00Z UP\n",
+        0,
+    );
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        ".zig-cache/tmp/{s}/mixed.log",
+        .{tmp.sub_path},
+    );
+
+    // the mixed naive/aware rejection fires after events have been appended;
+    // std.testing.allocator fails the test if parseFile leaks them
+    try testing.expectError(
+        error.MixedNaiveAwareEvents,
+        parseFile(testing.io, testing.allocator, path),
+    );
 }
 
 test "analyze: outage already in progress at the start is counted" {
