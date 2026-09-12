@@ -191,8 +191,23 @@ pub fn main(init: std.process.Init) !void {
     );
     const now = zdt.Datetime.nowUTC(init.io);
 
+    const transition = current_state != last_state;
+    const heartbeat = known.heartbeat == null or
+        (now.diff(known.heartbeat.?).asSeconds() >= heartbeat_interval);
+
     var pos = log_len;
-    if (current_state != last_state) {
+    // a log not ending at a line boundary (truncated write, crash, manual
+    // edit) must be repaired before appending, or the new entry glues onto
+    // the partial line and both records are lost; tail_buf holds the log's
+    // last byte at tail_buf[tail_len - 1]
+    if ((transition or heartbeat) and tail_len > 0 and
+        tail_buf[@intCast(tail_len - 1)] != '\n')
+    {
+        try log.writePositionalAll(init.io, "\n", pos);
+        pos += 1;
+    }
+
+    if (transition) {
         var line_buf: [64]u8 = undefined;
         const line = try uptime.formatLine(
             &line_buf,
@@ -203,9 +218,7 @@ pub fn main(init: std.process.Init) !void {
         pos += line.len;
     }
 
-    if (known.heartbeat == null or
-        (now.diff(known.heartbeat.?).asSeconds() >= heartbeat_interval))
-    {
+    if (heartbeat) {
         var line_buf: [64]u8 = undefined;
         const line = try uptime.formatLine(
             &line_buf,
