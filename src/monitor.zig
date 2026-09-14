@@ -115,16 +115,7 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
 
-    if (new_log) |f| {
-        defer f.close(init.io);
-        var line_buf: [64]u8 = undefined;
-        const line = try uptime.formatLine(
-            &line_buf,
-            zdt.Datetime.nowUTC(init.io),
-            "MONITOR STARTED",
-        );
-        try f.writePositionalAll(init.io, line, 0);
-    }
+    if (new_log) |f| f.close(init.io);
 
     // don't follow a symlink at the log path: a privileged monitor (e.g. a
     // root timer) must not append into a file chosen by whoever can plant a
@@ -150,6 +141,20 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer log.close(init.io);
+
+    // the MONITOR STARTED line is written under the exclusive lock, only
+    // while the log is still empty: writing it on the creating fd above
+    // would race another monitor's locked write (both at position 0),
+    // overwriting the start of the log
+    if ((try log.length(init.io)) == 0) {
+        var line_buf: [64]u8 = undefined;
+        const line = try uptime.formatLine(
+            &line_buf,
+            zdt.Datetime.nowUTC(init.io),
+            "MONITOR STARTED",
+        );
+        try log.writePositionalAll(init.io, line, 0);
+    }
 
     // only the tail of the log is needed to find the last known state
     const tail_size = 4096;
