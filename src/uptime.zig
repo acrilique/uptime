@@ -110,9 +110,17 @@ pub fn parseFile(
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
+    // cap the whole-file read so a hostile log path (FIFO, sparse file)
+    // cannot exhaust memory; 1 GiB is ~20M monitor runs, one line each
+    const max_log_size = 1 << 30;
     var buf: [1 << 16]u8 = undefined;
     var r = file.readerStreaming(io, &buf);
-    const data = try r.interface.allocRemaining(allocator, .unlimited);
+    const data = r.interface.allocRemaining(allocator, .limited(max_log_size)) catch |e| {
+        return switch (e) {
+            error.StreamTooLong => error.LogTooLarge,
+            else => e,
+        };
+    };
     defer allocator.free(data);
 
     var it = std.mem.tokenizeScalar(u8, data, '\n');
