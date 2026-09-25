@@ -33,6 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .clap = .{
+            .lazy = true,
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
             .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
@@ -41,6 +42,7 @@
             .hash = "zdt-0.9.8-xr0_vHrgEQA6h5_VpXPw5RPuNuks48Ukws5kB0vX0Nys",
         },
         .datastar = .{
+            .lazy = true,
             .url = "git+https://github.com/starfederation/datastar-zig#1f8529d286db70963560d9e7fb680be1b84837c5",
             .hash = "datastar_sdk_zig-0.1.0-IRNEdhNOAAAqlQb7oJWLU9KnorucKkrZ3H3UFurQzUxs",
         },

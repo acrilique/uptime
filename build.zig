@@ -4,9 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const clap = b.dependency("clap", .{});
     const zdt = b.dependency("zdt", .{});
-    const datastar = b.dependency("datastar", .{});
 
     const uptime = b.addModule("uptime", .{
         .root_source_file = b.path("src/uptime.zig"),
@@ -17,6 +15,13 @@ pub fn build(b: *std.Build) void {
         },
         .link_libc = true,
     });
+
+    if (b.dep_prefix.len != 0) return;
+
+    // lazy deps return null until the parent has fetched them and re-run
+    // this script, so the first configure pass ends early here
+    const clap = b.lazyDependency("clap", .{}) orelse return;
+    const datastar = b.lazyDependency("datastar", .{}) orelse return;
 
     const parser = b.addExecutable(.{
         .name = "uptime-parser",
