@@ -18,6 +18,7 @@ pub const std_options: std.Options = .{
 };
 
 const shell_tpl = @embedFile("shell.html");
+const archive_tpl = @embedFile("archive.html");
 const style_css = @embedFile("style.css");
 const datastar_js = @embedFile("vendor/datastar.js");
 
@@ -30,7 +31,10 @@ const default_tz = "localtime";
 /// family-sized: a handful of devices, each holding one SSE stream
 const max_connections: u32 = 32;
 const keepalive_ms: u64 = 15_000;
-const max_outage_rows: usize = 20;
+/// outages per archive page; older pages are reached via `before=` cursors
+const outage_page_size: usize = 15;
+/// rows the dashboard's outage teaser shows before linking to `/outages`
+const outage_teaser_rows: usize = 3;
 /// SVG timeline is drawn in a 1000-unit-wide viewBox
 const svg_width: f64 = 1000;
 /// minimum visible width of a downtime slice, in viewBox units
@@ -44,13 +48,14 @@ const Window = enum { h24, d7, d30 };
 const WindowSpec = struct {
     id: []const u8,
     label: []const u8,
+    tab: []const u8,
     hours: i96,
 };
 
 const window_specs = [_]WindowSpec{
-    .{ .id = "24h", .label = "24 hours", .hours = 24 },
-    .{ .id = "7d", .label = "7 days", .hours = 7 * 24 },
-    .{ .id = "30d", .label = "30 days", .hours = 30 * 24 },
+    .{ .id = "24h", .label = "24 hours", .tab = "24 h", .hours = 24 },
+    .{ .id = "7d", .label = "7 days", .tab = "7 days", .hours = 7 * 24 },
+    .{ .id = "30d", .label = "30 days", .tab = "30 days", .hours = 30 * 24 },
 };
 
 fn windowSpec(window: Window) WindowSpec {
@@ -81,6 +86,11 @@ fn nsBetween(a: zdt.Datetime, b: zdt.Datetime) i128 {
 
 fn durSecs(s: i64) zdt.Duration {
     return zdt.Duration.fromTimespanMultiple(s, .second) catch unreachable;
+}
+
+/// Same instant in UTC; naive datetimes pass through untouched.
+fn utcOf(when: zdt.Datetime) zdt.Datetime {
+    return when.tzConvert(.{ .tz = &zdt.Timezone.UTC }) catch when;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +155,9 @@ const Snapshot = struct {
     segs: []const uptime.Segment = &.{},
     outage_rows: []const uptime.Outage = &.{},
 
+    /// outage-list cursor: only outages that started strictly before it
+    /// are rendered; null means the newest page
+    before: ?zdt.Datetime = null,
     window: Window,
     ws: zdt.Datetime,
     we: zdt.Datetime,
@@ -158,10 +171,11 @@ fn buildSnapshot(
     io: Io,
     arena: std.mem.Allocator,
     log_path: []const u8,
-    window: Window,
+    view: View,
     threshold: zdt.Duration,
     now: zdt.Datetime,
 ) Snapshot {
+    const window = view.window;
     const dur = windowDuration(window);
     const ws = now.sub(dur) catch unreachable;
     const we = now;
@@ -194,6 +208,7 @@ fn buildSnapshot(
         .result = result,
         .segs = segs,
         .outage_rows = outage_rows,
+        .before = view.before,
         .window = window,
         .ws = ws,
         .we = we,
@@ -312,8 +327,8 @@ fn renderTimeline(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timez
 
     try w.print(
         \\<section id="timeline" class="timeline"><h2>Last {s}</h2>
-        \\<svg viewBox="0 0 1000 48" preserveAspectRatio="none" shape-rendering="crispEdges" role="img" aria-label="uptime timeline for the last {s}">
-    , .{ spec.label, spec.label });
+        \\<svg viewBox="0 0 {d:.0} 48" preserveAspectRatio="none" shape-rendering="crispEdges" role="img" aria-label="uptime timeline for the last {s}">
+    , .{ spec.label, svg_width, spec.label });
 
     for (snap.segs) |seg| {
         const start_ns: f64 = @floatFromInt(nsBetween(seg.start, snap.ws));
@@ -347,7 +362,9 @@ fn renderTimeline(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timez
     return buf.written();
 }
 
-fn renderOutages(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezone) ![]const u8 {
+/// The dashboard's outage section: a short peek at the newest outages,
+/// linking to the full paginated list on `/outages`.
+fn renderOutageTeaser(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezone) ![]const u8 {
     var buf: Io.Writer.Allocating = .init(arena);
     const w = &buf.writer;
 
@@ -369,23 +386,121 @@ fn renderOutages(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezo
 
     try w.writeAll("<table><thead><tr><th>Started</th><th>Lasted</th></tr></thead><tbody>");
     var i = snap.outage_rows.len;
-    while (i > 0) {
+    while (i > 0 and snap.outage_rows.len - i < outage_teaser_rows) {
         i -= 1;
-        const row = snap.outage_rows[i];
-        if (snap.outage_rows.len - i > max_outage_rows) break;
-        try w.writeAll("<tr><td>");
-        try writeTimestamp(w, row.start, tz);
-        if (row.end != null) {
-            try w.writeAll("</td><td>");
-            try writeDuration(w, row.dur);
-        } else {
-            try w.writeAll("</td><td class=\"ongoing\">still down");
-        }
-        try w.writeAll("</td></tr>");
+        try writeOutageRow(w, snap.outage_rows[i], tz);
     }
-    try w.writeAll("</tbody></table></section>");
+    try w.writeAll("</tbody></table>");
+    if (snap.outage_rows.len > outage_teaser_rows) {
+        try w.print(
+            "<a class=\"more\" href=\"/outages?window={s}\">All outages →</a>",
+            .{windowSpec(snap.window).id},
+        );
+    }
+    try w.writeAll("</section>");
 
     return buf.written();
+}
+
+/// One page of the outage archive: the `outage_page_size` newest outages
+/// that started strictly before `snap.before` (the newest ones when it is
+/// null). Cursor links keep deeper pages anchored while outages arrive.
+fn renderOutages(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezone) ![]const u8 {
+    var buf: Io.Writer.Allocating = .init(arena);
+    const w = &buf.writer;
+
+    if (!snap.ok) {
+        try w.print(
+            \\<section id="outages"><p class="empty">{s}</p></section>
+        , .{snap.err_msg});
+        return buf.written();
+    }
+
+    try w.print(
+        \\<section id="outages"><h2>Outages ({d})</h2>
+    , .{snap.result.outage_count});
+
+    if (snap.outage_rows.len == 0) {
+        try w.writeAll("<p class=\"empty\">No downtime recorded in this window.</p></section>");
+        return buf.written();
+    }
+
+    // rows are chronological; walk the newest boundary down to the cursor
+    const rows = snap.outage_rows;
+    var end = rows.len;
+    if (snap.before) |cursor| {
+        while (end > 0 and
+            (zdt.Datetime.compareUT(rows[end - 1].start, cursor) catch unreachable) != .lt)
+        {
+            end -= 1;
+        }
+    }
+
+    if (end == 0) {
+        try w.writeAll("<p class=\"empty\">No outages before this point.</p>");
+        try writePager(w, snap, 0, 0);
+        try w.writeAll("</section>");
+        return buf.written();
+    }
+
+    const start = end -| outage_page_size;
+
+    try w.writeAll("<table><thead><tr><th>Started</th><th>Lasted</th></tr></thead><tbody>");
+    var i = end;
+    while (i > start) {
+        i -= 1;
+        try writeOutageRow(w, rows[i], tz);
+    }
+    try w.writeAll("</tbody></table>");
+    try writePager(w, snap, start, end);
+    try w.writeAll("</section>");
+
+    return buf.written();
+}
+
+fn writeOutageRow(w: *Io.Writer, row: uptime.Outage, tz: *const zdt.Timezone) !void {
+    try w.writeAll("<tr><td>");
+    try writeTimestamp(w, row.start, tz);
+    if (row.end != null) {
+        try w.writeAll("</td><td>");
+        try writeDuration(w, row.dur);
+    } else {
+        try w.writeAll("</td><td class=\"ongoing\">still down");
+    }
+    try w.writeAll("</td></tr>");
+}
+
+/// Prev/next links around one archive page. "Older" anchors at the oldest
+/// visible row; "Newer" at the row one full page above it, dropping the
+/// cursor when that page already reaches the newest outages.
+fn writePager(w: *Io.Writer, snap: Snapshot, start: usize, end: usize) !void {
+    const rows = snap.outage_rows;
+    const id = windowSpec(snap.window).id;
+
+    const has_newer = end < rows.len;
+    const newer_before: ?zdt.Datetime = if (has_newer and end + outage_page_size < rows.len)
+        rows[end + outage_page_size].start
+    else
+        null;
+    const older_before: ?zdt.Datetime = if (start > 0) rows[start].start else null;
+
+    if (!has_newer and older_before == null) return;
+
+    try w.writeAll("<nav class=\"pager\">");
+    if (has_newer) {
+        if (newer_before) |cursor| {
+            try w.print("<a href=\"/outages?window={s}&before={f}\">← Newer</a>", .{ id, utcOf(cursor) });
+        } else {
+            try w.print("<a href=\"/outages?window={s}\">← Newer</a>", .{id});
+        }
+    }
+    if (older_before) |cursor| {
+        try w.print(
+            "<a class=\"older\" href=\"/outages?window={s}&before={f}\">Older →</a>",
+            .{ id, utcOf(cursor) },
+        );
+    }
+    try w.writeAll("</nav>");
 }
 
 fn renderGenerated(arena: std.mem.Allocator, now: zdt.Datetime, tz: *const zdt.Timezone, refresh_s: u32) ![]const u8 {
@@ -401,6 +516,21 @@ fn tabCls(current: Window, tab: Window) []const u8 {
     return if (current == tab) "active" else "";
 }
 
+/// The window tabs; `base` ("/" or "/outages") keeps them on the current
+/// surface.
+fn renderTabs(arena: std.mem.Allocator, base: []const u8, current: Window) ![]const u8 {
+    var buf: Io.Writer.Allocating = .init(arena);
+    const w = &buf.writer;
+    try w.writeAll("<nav class=\"tabs\" aria-label=\"Time window\">");
+    for (window_specs, 0..) |spec, i| {
+        try w.print("<a href=\"{s}?window={s}\" class=\"{s}\">{s}</a>", .{
+            base, spec.id, tabCls(current, @enumFromInt(i)), spec.tab,
+        });
+    }
+    try w.writeAll("</nav>");
+    return buf.written();
+}
+
 fn renderPage(
     arena: std.mem.Allocator,
     snap: Snapshot,
@@ -411,19 +541,33 @@ fn renderPage(
     const hero = try renderHero(arena, snap, tz);
     const summary = try renderSummary(arena, snap);
     const timeline = try renderTimeline(arena, snap, tz);
-    const outages = try renderOutages(arena, snap, tz);
+    const outages = try renderOutageTeaser(arena, snap, tz);
     const generated = try wrapGenerated(arena, try renderGenerated(arena, now, tz, refresh_s));
+    const tabs = try renderTabs(arena, "/", snap.window);
 
     return std.fmt.allocPrint(arena, shell_tpl, .{
         windowSpec(snap.window).id, // <body data-init> SSE bootstrap, first {s} in the shell
         hero,
-        tabCls(snap.window, .h24),
-        tabCls(snap.window, .d7),
-        tabCls(snap.window, .d30),
+        tabs,
         summary,
         timeline,
         outages,
         generated,
+    });
+}
+
+/// The `/outages` page: a breadcrumb back to the dashboard, the window
+/// tabs and one full page of the outage list.
+fn renderArchive(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezone) ![]const u8 {
+    var head: Io.Writer.Allocating = .init(arena);
+    try head.writer.print(
+        "<p class=\"back\"><a href=\"/?window={s}\">← Dashboard</a></p>",
+        .{windowSpec(snap.window).id},
+    );
+    return std.fmt.allocPrint(arena, archive_tpl, .{
+        head.written(),
+        try renderTabs(arena, "/outages", snap.window),
+        try renderOutages(arena, snap, tz),
     });
 }
 
@@ -438,7 +582,7 @@ fn snapshotBlocks(
     const hero = try datastar.patchElements(arena, try renderHero(arena, snap, tz), .{});
     const summary = try datastar.patchElements(arena, try renderSummary(arena, snap), .{});
     const timeline = try datastar.patchElements(arena, try renderTimeline(arena, snap, tz), .{});
-    const outages = try datastar.patchElements(arena, try renderOutages(arena, snap, tz), .{});
+    const outages = try datastar.patchElements(arena, try renderOutageTeaser(arena, snap, tz), .{});
     const generated = try datastar.patchElements(
         arena,
         try wrapGenerated(arena, try renderGenerated(arena, now, tz, refresh_s)),
@@ -663,20 +807,28 @@ fn handleRequest(
     const query = if (q_idx) |i| target[i + 1 ..] else "";
 
     if (std.mem.eql(u8, path, "/")) {
-        const window = windowFromQuery(query) catch
-            return request.respond("unknown window", .{ .status = .bad_request });
+        const view = viewFromQuery(query) catch |e| return badQuery(request, e);
         const now = zdt.Datetime.nowUTC(io);
-        const snap = buildSnapshot(io, arena, cfg.log_path, window, cfg.threshold, now);
+        const snap = buildSnapshot(io, arena, cfg.log_path, view, cfg.threshold, now);
         const body = try renderPage(arena, snap, cfg.tz, cfg.refresh_s, now);
         return request.respond(body, .{
             .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=UTF-8" }},
         });
     }
 
+    if (std.mem.eql(u8, path, "/outages")) {
+        const view = viewFromQuery(query) catch |e| return badQuery(request, e);
+        const now = zdt.Datetime.nowUTC(io);
+        const snap = buildSnapshot(io, arena, cfg.log_path, view, cfg.threshold, now);
+        const body = try renderArchive(arena, snap, cfg.tz);
+        return request.respond(body, .{
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=UTF-8" }},
+        });
+    }
+
     if (std.mem.eql(u8, path, "/events")) {
-        const window = windowFromQuery(query) catch
-            return request.respond("unknown window", .{ .status = .bad_request });
-        return handleEvents(io, gpa, cfg, request, window);
+        const view = viewFromQuery(query) catch |e| return badQuery(request, e);
+        return handleEvents(io, gpa, cfg, request, view);
     }
 
     if (std.mem.eql(u8, path, "/style.css")) {
@@ -696,15 +848,37 @@ fn handleRequest(
     return request.respond("not found", .{ .status = .not_found });
 }
 
-/// The `window` query parameter: default when absent, error when unknown.
-fn windowFromQuery(query: []const u8) !Window {
+/// The query parameters that pick what a page renders: `window` (default
+/// when absent, error when unknown) and `before`, the outage-list cursor.
+const View = struct {
+    window: Window = .h24,
+    before: ?zdt.Datetime = null,
+};
+
+fn viewFromQuery(query: []const u8) !View {
+    var view: View = .{};
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (std.mem.startsWith(u8, pair, "window=")) {
-            return windowFromId(pair["window=".len..]) orelse error.UnknownWindow;
+            view.window = windowFromId(pair["window=".len..]) orelse
+                return error.UnknownWindow;
+        } else if (std.mem.startsWith(u8, pair, "before=")) {
+            const ts = zdt.Datetime.fromISO8601(pair["before=".len..]) catch
+                return error.BadCursor;
+            // normalize to UTC so the cursor survives the URL round-trip
+            view.before = utcOf(ts);
         }
     }
-    return .h24;
+    return view;
+}
+
+fn badQuery(request: *std.http.Server.Request, err: anyerror) !void {
+    const msg = switch (err) {
+        error.UnknownWindow => "unknown window",
+        error.BadCursor => "invalid `before` value",
+        else => "invalid query",
+    };
+    return request.respond(msg, .{ .status = .bad_request });
 }
 
 fn handleEvents(
@@ -712,7 +886,7 @@ fn handleEvents(
     gpa: std.mem.Allocator,
     cfg: *const Config,
     request: *std.http.Server.Request,
-    window: Window,
+    view: View,
 ) !void {
     var body_buffer: [4096]u8 = undefined;
     var body = try request.respondStreaming(&body_buffer, .{
@@ -733,7 +907,7 @@ fn handleEvents(
         defer _ = tick.reset(.retain_capacity);
 
         const now = zdt.Datetime.nowUTC(io);
-        const snap = buildSnapshot(io, tick.allocator(), cfg.log_path, window, cfg.threshold, now);
+        const snap = buildSnapshot(io, tick.allocator(), cfg.log_path, view, cfg.threshold, now);
         const block = try snapshotBlocks(tick.allocator(), snap, cfg.tz, cfg.refresh_s, now);
 
         body.writer.writeAll(block) catch return;
@@ -774,11 +948,21 @@ test "windowFromId: known and unknown ids" {
     try testing.expect(windowFromId("24H") == null);
 }
 
-test "windowFromQuery: absent defaults, unknown errors" {
-    try testing.expectEqual(Window.h24, try windowFromQuery(""));
-    try testing.expectEqual(Window.d7, try windowFromQuery("window=7d"));
-    try testing.expectEqual(Window.d30, try windowFromQuery("a=1&window=30d&b=2"));
-    try testing.expectError(error.UnknownWindow, windowFromQuery("window=99d"));
+test "viewFromQuery: defaults, window and cursor parsing" {
+    var view = try viewFromQuery("");
+    try testing.expect(view.window == .h24);
+    try testing.expect(view.before == null);
+
+    view = try viewFromQuery("window=7d");
+    try testing.expect(view.window == .d7);
+    try testing.expect(view.before == null);
+
+    view = try viewFromQuery("a=1&window=30d&before=2026-09-24T01:00:00Z");
+    try testing.expect(view.window == .d30);
+    try testing.expect(view.before != null);
+
+    try testing.expectError(error.UnknownWindow, viewFromQuery("window=99d"));
+    try testing.expectError(error.BadCursor, viewFromQuery("before=yesterday"));
 }
 
 test "writeDuration: human scales" {
@@ -843,7 +1027,13 @@ test "renderTimeline: segment geometry and error variant" {
     const ws = dt("2026-09-24T00:00:00Z");
     const we = dt("2026-09-25T00:00:00Z");
 
-    // one hour of downtime, one hour into the window: x≈41.67 w≈41.67
+    // one hour of downtime, one hour into a 24h window: a svg_width/24-wide
+    // slice, clamped the same way the renderer clamps short outages
+    const slice = svg_width / 24.0;
+    const want_w = @max(slice, min_down_width);
+    const want_x = @min(slice, svg_width - want_w);
+    const want_x_str = try std.fmt.allocPrint(arena, "x=\"{d:.2}\"", .{want_x});
+    const want_w_str = try std.fmt.allocPrint(arena, "width=\"{d:.2}\"", .{want_w});
     const snap = Snapshot{
         .ok = true,
         .window = .h24,
@@ -856,7 +1046,8 @@ test "renderTimeline: segment geometry and error variant" {
         },
     };
     const html = try renderTimeline(arena, snap, &zdt.Timezone.UTC);
-    try testing.expect(std.mem.indexOf(u8, html, "x=\"41.67\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, want_x_str) != null);
+    try testing.expect(std.mem.indexOf(u8, html, want_w_str) != null);
     try testing.expect(std.mem.indexOf(u8, html, "seg-down") != null);
     try testing.expect(std.mem.indexOf(u8, html, "Last 24 hours") != null);
 
@@ -865,22 +1056,129 @@ test "renderTimeline: segment geometry and error variant" {
     try testing.expect(std.mem.indexOf(u8, html2, "nope") != null);
 }
 
-test "renderOutages: ongoing row and empty state" {
+/// one full archive page plus the teaser overhang: hourly outages starting
+/// at `ws`, chronological; the newest ongoing
+fn fillTestOutages(rows: []uptime.Outage, ws: zdt.Datetime) void {
+    for (rows, 0..) |*row, i| {
+        const start = ws.add(durSecs(@intCast(i * 3600))) catch unreachable;
+        row.* = .{
+            .start = start,
+            .end = if (i == rows.len - 1) null else start.add(durSecs(300)) catch unreachable,
+            .dur = durSecs(300),
+        };
+    }
+}
+
+test "renderOutageTeaser: newest rows capped, link to the archive" {
     var arena_state = testArena(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    const ws = dt("2026-09-24T00:00:00Z");
+    var rows_buf: [outage_page_size + outage_teaser_rows]uptime.Outage = undefined;
+    fillTestOutages(&rows_buf, ws);
 
     const we = dt("2026-09-25T00:00:00Z");
     const snap = Snapshot{
         .ok = true,
         .window = .h24,
-        .ws = dt("2026-09-24T00:00:00Z"),
+        .ws = ws,
         .we = we,
         .result = zero_result,
-        .outage_rows = &.{.{ .start = dt("2026-09-24T23:00:00Z"), .end = null, .dur = durSecs(3600) }},
+        .outage_rows = &rows_buf,
     };
-    const html = try renderOutages(arena, snap, &zdt.Timezone.UTC);
-    try testing.expect(std.mem.indexOf(u8, html, "still down") != null);
+    const html = try renderOutageTeaser(arena, snap, &zdt.Timezone.UTC);
+    try testing.expectEqual(outage_teaser_rows, std.mem.count(u8, html, "<tr><td>"));
+    try testing.expect(std.mem.indexOf(u8, html, "All outages →") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "href=\"/outages?window=24h\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "pager") == null);
+
+    // exactly one teaser's worth of outages: everything shown, no archive link
+    const few = Snapshot{
+        .ok = true,
+        .window = .h24,
+        .ws = ws,
+        .we = we,
+        .result = zero_result,
+        .outage_rows = rows_buf[0..outage_teaser_rows],
+    };
+    const html2 = try renderOutageTeaser(arena, few, &zdt.Timezone.UTC);
+    try testing.expectEqual(outage_teaser_rows, std.mem.count(u8, html2, "<tr><td>"));
+    try testing.expect(std.mem.indexOf(u8, html2, "All outages") == null);
+}
+
+test "renderArchive: breadcrumb, tabs and one full page wired" {
+    var arena_state = testArena(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ws = dt("2026-09-24T00:00:00Z");
+    var rows_buf: [outage_page_size + outage_teaser_rows]uptime.Outage = undefined;
+    fillTestOutages(&rows_buf, ws);
+
+    const snap = Snapshot{
+        .ok = true,
+        .window = .d7,
+        .ws = ws,
+        .we = dt("2026-09-25T00:00:00Z"),
+        .result = zero_result,
+        .outage_rows = &rows_buf,
+    };
+    const html = try renderArchive(arena, snap, &zdt.Timezone.UTC);
+
+    try testing.expect(
+        std.mem.indexOf(u8, html, "<p class=\"back\"><a href=\"/?window=7d\">← Dashboard</a></p>") != null,
+    );
+    try testing.expect(std.mem.indexOf(u8, html, "href=\"/outages?window=7d\"") != null);
+    try testing.expectEqual(outage_page_size, std.mem.count(u8, html, "<tr><td>"));
+    try testing.expect(std.mem.indexOf(u8, html, "Older →") != null);
+}
+
+test "renderOutages: cursor paging, ongoing row and empty states" {
+    var arena_state = testArena(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const we = dt("2026-09-25T00:00:00Z");
+    const ws = dt("2026-09-24T00:00:00Z");
+
+    var rows_buf: [outage_page_size + outage_teaser_rows]uptime.Outage = undefined;
+    fillTestOutages(&rows_buf, ws);
+
+    var snap = Snapshot{
+        .ok = true,
+        .window = .h24,
+        .ws = ws,
+        .we = we,
+        .result = zero_result,
+        .outage_rows = &rows_buf,
+    };
+
+    {
+        // newest page: the outage_page_size newest rows, Older link, no Newer
+        const html = try renderOutages(arena, snap, &zdt.Timezone.UTC);
+        try testing.expect(std.mem.indexOf(u8, html, "still down") != null);
+        try testing.expect(std.mem.indexOf(u8, html, "Older →") != null);
+        try testing.expect(std.mem.indexOf(u8, html, "href=\"/outages?window=24h&before=") != null);
+        try testing.expect(std.mem.indexOf(u8, html, "Newer") == null);
+        // cursors must be URL-safe UTC ISO, never `+hh:mm` offsets
+        try testing.expect(std.mem.indexOf(u8, html, "+") == null);
+    }
+    {
+        // cursor one full page up: exactly that page remains, Older gone, Newer back
+        snap.before = rows_buf[outage_page_size].start;
+        const html = try renderOutages(arena, snap, &zdt.Timezone.UTC);
+        try testing.expect(std.mem.indexOf(u8, html, "Older →") == null);
+        try testing.expect(std.mem.indexOf(u8, html, "Newer") != null);
+        try testing.expect(std.mem.indexOf(u8, html, "still down") == null);
+    }
+    {
+        // cursor older than every row: empty page, Newer remains
+        snap.before = ws;
+        const html = try renderOutages(arena, snap, &zdt.Timezone.UTC);
+        try testing.expect(std.mem.indexOf(u8, html, "No outages before this point") != null);
+        try testing.expect(std.mem.indexOf(u8, html, "Newer") != null);
+    }
 
     const empty = Snapshot{
         .ok = true,

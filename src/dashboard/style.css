@@ -32,7 +32,7 @@
 
 body {
   margin: 0;
-  padding: 0 1rem 2rem;
+  padding: 1.5rem 1rem 2rem;
   background: var(--bg);
   color: var(--fg);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -110,7 +110,6 @@ h2 {
 
 .hero .stale-badge {
   display: inline-block;
-  margin-left: 0.4rem;
   padding: 0.05rem 0.5rem;
   border-radius: 999px;
   border: 1px solid var(--muted);
@@ -288,6 +287,46 @@ p.empty {
   border-radius: 10px;
   padding: 1rem;
   text-align: center;
+}
+
+/* outage teaser link + archive breadcrumb */
+
+a.more {
+  display: block;
+  text-align: right;
+  margin-top: 0.6rem;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 1.05rem;
+}
+
+p.back {
+  margin: 0.4rem 0 0;
+}
+
+p.back a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 1.05rem;
+}
+
+/* outage pager */
+
+nav.pager {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+/* sole link (first page: only "Older") sits right, not left */
+nav.pager a.older {
+  margin-left: auto;
+}
+
+nav.pager a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 1.05rem;
 }
 
 /* footer */
