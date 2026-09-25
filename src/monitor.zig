@@ -69,11 +69,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const log_path = if (res.positionals[0]) |l| l else {
-        std.log.err("Missing log file path argument.\nUsage:", .{});
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer =
             std.Io.File.stderr().writer(init.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
+        try stderr.writeAll("error: Missing log file path argument.\nUsage:");
         try clap.usage(stderr, clap.Help, &params);
         try stderr.writeAll("\n");
         try stderr.flush();
@@ -86,13 +86,13 @@ pub fn main(init: std.process.Init) !void {
     const heartbeat_interval = res.args.@"heartbeat-interval" orelse 1800;
 
     if (timeout == 0) {
-        std.log.err("Invalid timeout value: {d}", .{timeout});
+        std.debug.print("error: Invalid timeout value: {d}\n", .{timeout});
         return error.InvalidArgumentValue;
     }
 
     // fail early and clearly on a bad --target, before touching the log
     _ = std.Io.net.Ip4Address.parse(target, 53) catch {
-        std.log.err("Error parsing `--target` argument. An IPv4 address is expected.", .{});
+        std.debug.print("error: Error parsing `--target` argument. An IPv4 address is expected.\n", .{});
         return error.ParseError;
     };
 
@@ -133,8 +133,8 @@ pub fn main(init: std.process.Init) !void {
             .{ .mode = .read_write, .lock = .exclusive, .follow_symlinks = false },
         )) catch |err| {
         if (err == error.SymLinkLoop) {
-            std.log.err(
-                "The log path '{s}' is a symbolic link. Refusing to follow it.",
+            std.debug.print(
+                "error: The log path '{s}' is a symbolic link. Refusing to follow it.\n",
                 .{log_path},
             );
         }
@@ -180,8 +180,8 @@ pub fn main(init: std.process.Init) !void {
 
     const known = uptime.lastKnown(tail);
     if (known.naive) {
-        std.log.err(
-            "The log '{s}' contains naive timestamps (no UTC offset), but the monitor logs aware ones (e.g. 2026-08-01T10:00:00Z); mixing the two makes the log unanalyzable. Fix the timestamps or move the log away and let the monitor start a fresh one.",
+        std.debug.print(
+            "error: The log '{s}' contains naive timestamps (no UTC offset), but the monitor logs aware ones (e.g. 2026-08-01T10:00:00Z); mixing the two makes the log unanalyzable. Fix the timestamps or move the log away and let the monitor start a fresh one.\n",
             .{log_path},
         );
         return error.NaiveLogFile;
