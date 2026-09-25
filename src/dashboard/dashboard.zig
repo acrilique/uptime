@@ -17,9 +17,9 @@ pub const std_options: std.Options = .{
     .log_level = .warn,
 };
 
-const shell_tpl = @embedFile("web/shell.html");
-const style_css = @embedFile("web/style.css");
-const datastar_js = @embedFile("web/vendor/datastar.js");
+const shell_tpl = @embedFile("shell.html");
+const style_css = @embedFile("style.css");
+const datastar_js = @embedFile("vendor/datastar.js");
 
 const default_address = "0.0.0.0";
 const default_port: u16 = 8080;

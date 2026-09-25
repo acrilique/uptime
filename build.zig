@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const dashboard_module = b.createModule(.{
-        .root_source_file = b.path("src/dashboard.zig"),
+        .root_source_file = b.path("src/dashboard/dashboard.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
