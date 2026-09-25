@@ -109,15 +109,6 @@ fn writeDuration(w: *Io.Writer, dur: zdt.Duration) !void {
     }
 }
 
-fn writeAgo(w: *Io.Writer, dur: zdt.Duration) !void {
-    if (secondsOf(dur) < 45) {
-        try w.writeAll("just now");
-        return;
-    }
-    try writeDuration(w, dur);
-    try w.writeAll(" ago");
-}
-
 /// "Thu 25 Sep, 14:32" in the display timezone; raw fields on tz failure.
 fn writeTimestamp(w: *Io.Writer, when: zdt.Datetime, tz: *const zdt.Timezone) !void {
     const local = when.tzConvert(.{ .tz = tz }) catch {
@@ -148,7 +139,6 @@ const Snapshot = struct {
     state: HeroState = .none,
     since: zdt.Datetime = undefined,
     since_dur: zdt.Duration = .{},
-    last_age: zdt.Duration = .{},
     stale: bool = false,
 
     result: uptime.Result = undefined,
@@ -220,8 +210,7 @@ fn buildSnapshot(
     snap.state = if (last.state) .up else .down;
     snap.since = items[run_start_idx].ts;
     snap.since_dur = we.diff(snap.since);
-    snap.last_age = we.diff(last.ts);
-    snap.stale = snap.last_age.asNanoseconds() > threshold.asNanoseconds();
+    snap.stale = we.diff(last.ts).asNanoseconds() > threshold.asNanoseconds();
 
     return snap;
 }
@@ -260,11 +249,9 @@ fn renderHero(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezone)
         try writeTimestamp(w, snap.since, tz);
         try w.writeAll("</strong> (");
         try writeDuration(w, snap.since_dur);
-        try w.writeAll(")</p><p>Last check <strong>");
-        try writeAgo(w, snap.last_age);
-        try w.writeAll("</strong>");
-        if (snap.stale) try w.writeAll(" <span class=\"stale-badge\">stale</span>");
-        try w.writeAll("</p></div>");
+        try w.writeAll(")</p>");
+        if (snap.stale) try w.writeAll("<p><span class=\"stale-badge\">stale</span></p>");
+        try w.writeAll("</div>");
     } else {
         try w.writeAll("<div class=\"meta\"><p>No data.</p></div>");
     }
@@ -823,7 +810,6 @@ test "renderHero: up, down, stale and error variants" {
         .state = .up,
         .since = dt("2026-09-24T10:00:00Z"),
         .since_dur = durSecs(7200),
-        .last_age = durSecs(60),
         .window = .h24,
         .ws = dt("2026-09-24T00:00:00Z"),
         .we = dt("2026-09-25T00:00:00Z"),
