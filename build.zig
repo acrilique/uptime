@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
 
     const clap = b.dependency("clap", .{});
     const zdt = b.dependency("zdt", .{});
+    const datastar = b.dependency("datastar", .{});
 
     const uptime = b.addModule("uptime", .{
         .root_source_file = b.path("src/uptime.zig"),
@@ -49,8 +50,27 @@ pub fn build(b: *std.Build) void {
         .root_module = monitor_module,
     });
 
+    const dashboard_module = b.createModule(.{
+        .root_source_file = b.path("src/dashboard.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zdt", .module = zdt.module("zdt") },
+            .{ .name = "clap", .module = clap.module("clap") },
+            .{ .name = "uptime", .module = uptime },
+            .{ .name = "datastar", .module = datastar.module("datastar") },
+        },
+        .link_libc = true,
+    });
+
+    const dashboard = b.addExecutable(.{
+        .name = "uptime-dashboard",
+        .root_module = dashboard_module,
+    });
+
     b.installArtifact(parser);
     b.installArtifact(monitor);
+    b.installArtifact(dashboard);
 
     const parser_run_step = b.step("run-parser", "Run the parser");
 
@@ -74,6 +94,17 @@ pub fn build(b: *std.Build) void {
         monitor_run_cmd.addArgs(args);
     }
 
+    const dashboard_run_step = b.step("run-dashboard", "Run the dashboard");
+
+    const dashboard_run_cmd = b.addRunArtifact(dashboard);
+    dashboard_run_step.dependOn(&dashboard_run_cmd.step);
+
+    dashboard_run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        dashboard_run_cmd.addArgs(args);
+    }
+
     const uptime_tests = b.addTest(.{
         .root_module = uptime,
     });
@@ -86,7 +117,14 @@ pub fn build(b: *std.Build) void {
 
     const run_monitor_tests = b.addRunArtifact(monitor_tests);
 
+    const dashboard_tests = b.addTest(.{
+        .root_module = dashboard_module,
+    });
+
+    const run_dashboard_tests = b.addRunArtifact(dashboard_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_uptime_tests.step);
     test_step.dependOn(&run_monitor_tests.step);
+    test_step.dependOn(&run_dashboard_tests.step);
 }

@@ -258,62 +258,20 @@ pub fn analyze(
     // reaches past the timespan can only come from caller-supplied bounds.
     switch (try windowCoverage(ws, we, first_ts, last_ts)) {
         .inside => {},
-        .partial => std.log.warn(
+        .partial => std.log.info(
             "Window {f} → {f} partially falls outside the log's timespan ({f} → {f})",
             .{ ws, we, first_ts, last_ts },
         ),
-        .outside => std.log.warn(
+        .outside => std.log.info(
             "Window {f} → {f} falls entirely outside the log's timespan ({f} → {f})",
             .{ ws, we, first_ts, last_ts },
         ),
     }
 
-    var uptime: zdt.Duration = .{};
-    var downtime: zdt.Duration = .{};
-    var outage_count: u32 = 0;
-    var last_observed: ?bool = null;
+    var fold: IntervalFold = .{};
+    try walkIntervals(events.items, ws, we, threshold, &fold, IntervalFold.onInterval);
 
-    for (events.items, 0..) |event, index| {
-        const next_ts = if ((index + 1) < events.items.len)
-            events.items[index + 1].ts
-        else
-            we;
-
-        const interval_start =
-            if (try zdt.Datetime.compareUT(event.ts, ws) == .gt)
-                event.ts
-            else
-                ws;
-
-        const event_plus_th = try event.ts.add(threshold);
-
-        const temp_min =
-            if (try zdt.Datetime.compareUT(event_plus_th, next_ts) == .gt)
-                next_ts
-            else
-                event_plus_th;
-
-        const interval_end =
-            if (try zdt.Datetime.compareUT(temp_min, we) == .gt)
-                we
-            else
-                temp_min;
-
-        if (try zdt.Datetime.compareUT(interval_end, interval_start) == .gt) {
-            const observed = interval_end.diff(interval_start);
-            if (event.state) {
-                uptime = try uptime.add(observed);
-            } else {
-                downtime = try downtime.add(observed);
-                // null means nothing was observed before it: the outage was
-                // already in progress when the window opened
-                if (last_observed orelse true) outage_count += 1;
-            }
-            last_observed = event.state;
-        }
-    }
-
-    const observed_time = try uptime.add(downtime);
+    const observed_time = try fold.uptime.add(fold.downtime);
     const window_length = we.diff(ws);
     const zerodur: zdt.Duration = .{};
     const lost_time =
@@ -325,13 +283,191 @@ pub fn analyze(
     return Result{
         .window_start = ws,
         .window_end = we,
-        .up_time = uptime,
-        .down_time = downtime,
+        .up_time = fold.uptime,
+        .down_time = fold.downtime,
         .observed_time = observed_time,
         .lost_time = lost_time,
         .window_length = window_length,
-        .outage_count = outage_count,
+        .outage_count = fold.outage_count,
     };
+}
+
+fn walkIntervals(
+    events: []const Event,
+    ws: zdt.Datetime,
+    we: zdt.Datetime,
+    threshold: zdt.Duration,
+    ctx: anytype,
+    comptime onInterval: fn (
+        @TypeOf(ctx),
+        state: bool,
+        start: zdt.Datetime,
+        end: zdt.Datetime,
+    ) anyerror!void,
+) !void {
+    for (events, 0..) |event, index| {
+        const next_ts = if ((index + 1) < events.len) events[index + 1].ts else we;
+
+        const interval_start =
+            if ((try zdt.Datetime.compareUT(event.ts, ws)) == .gt) event.ts else ws;
+
+        const event_plus_th = try event.ts.add(threshold);
+        const temp_min =
+            if ((try zdt.Datetime.compareUT(event_plus_th, next_ts)) == .gt) next_ts else event_plus_th;
+        const interval_end =
+            if ((try zdt.Datetime.compareUT(temp_min, we)) == .gt) we else temp_min;
+
+        if ((try zdt.Datetime.compareUT(interval_end, interval_start)) != .gt) continue;
+
+        try onInterval(ctx, event.state, interval_start, interval_end);
+    }
+}
+
+const OutageGrouping = struct {
+    down_open: bool = false,
+    up_since_down: bool = false,
+
+    /// Note an observed interval; returns true when it starts a new outage.
+    fn note(self: *OutageGrouping, state: bool) bool {
+        if (state) {
+            self.up_since_down = true;
+            return false;
+        }
+        const new_outage = !self.down_open or self.up_since_down;
+        self.down_open = true;
+        self.up_since_down = false;
+        return new_outage;
+    }
+};
+
+/// Fold of the observed intervals: uptimes, downtimes and the outage count.
+const IntervalFold = struct {
+    uptime: zdt.Duration = .{},
+    downtime: zdt.Duration = .{},
+    outage_count: u32 = 0,
+    grouping: OutageGrouping = .{},
+
+    fn onInterval(
+        self: *IntervalFold,
+        state: bool,
+        start: zdt.Datetime,
+        end: zdt.Datetime,
+    ) anyerror!void {
+        if (self.grouping.note(state)) self.outage_count += 1;
+        const dur = end.diff(start);
+        if (state) {
+            self.uptime = try self.uptime.add(dur);
+        } else {
+            self.downtime = try self.downtime.add(dur);
+        }
+    }
+};
+
+pub const SegState = enum { up, down, unknown };
+
+pub const Segment = struct {
+    state: SegState,
+    start: zdt.Datetime,
+    end: zdt.Datetime,
+};
+
+pub fn buildSegments(
+    allocator: std.mem.Allocator,
+    events: []const Event,
+    ws: zdt.Datetime,
+    we: zdt.Datetime,
+    threshold: zdt.Duration,
+) ![]Segment {
+    var segs: std.ArrayList(Segment) = .empty;
+    errdefer segs.deinit(allocator);
+
+    const Collector = struct {
+        segs: *std.ArrayList(Segment),
+        allocator: std.mem.Allocator,
+        cursor: zdt.Datetime,
+
+        fn onInterval(
+            self: *@This(),
+            state: bool,
+            start: zdt.Datetime,
+            end: zdt.Datetime,
+        ) anyerror!void {
+            if ((try zdt.Datetime.compareUT(start, self.cursor)) == .gt) {
+                try appendMerged(self.allocator, self.segs, .{ .state = .unknown, .start = self.cursor, .end = start });
+            }
+            try appendMerged(self.allocator, self.segs, .{
+                .state = if (state) .up else .down,
+                .start = start,
+                .end = end,
+            });
+            self.cursor = end;
+        }
+    };
+    var collector = Collector{ .segs = &segs, .allocator = allocator, .cursor = ws };
+    try walkIntervals(events, ws, we, threshold, &collector, Collector.onInterval);
+
+    if ((try zdt.Datetime.compareUT(collector.cursor, we)) == .lt) {
+        try appendMerged(allocator, &segs, .{ .state = .unknown, .start = collector.cursor, .end = we });
+    }
+
+    return segs.toOwnedSlice(allocator);
+}
+
+fn appendMerged(allocator: std.mem.Allocator, segs: *std.ArrayList(Segment), seg: Segment) !void {
+    if (segs.items.len > 0) {
+        const last = &segs.items[segs.items.len - 1];
+        if (last.state == seg.state) {
+            last.end = seg.end;
+            return;
+        }
+    }
+    try segs.append(allocator, seg);
+}
+
+pub const Outage = struct {
+    start: zdt.Datetime,
+    /// end of the last down segment; `null` when the outage is ongoing
+    end: ?zdt.Datetime,
+    dur: zdt.Duration,
+};
+
+pub fn outagesFromSegments(
+    allocator: std.mem.Allocator,
+    segs: []const Segment,
+    now: zdt.Datetime,
+) ![]Outage {
+    var rows: std.ArrayList(Outage) = .empty;
+    errdefer rows.deinit(allocator);
+    var grouping: OutageGrouping = .{};
+
+    for (segs) |seg| {
+        switch (seg.state) {
+            .unknown => {},
+            .up => _ = grouping.note(true),
+            .down => {
+                if (grouping.note(false)) {
+                    try rows.append(allocator, .{
+                        .start = seg.start,
+                        .end = seg.end,
+                        .dur = seg.end.diff(seg.start),
+                    });
+                } else {
+                    const last = &rows.items[rows.items.len - 1];
+                    last.end = seg.end;
+                    last.dur = try last.dur.add(seg.end.diff(seg.start));
+                }
+            },
+        }
+    }
+
+    if (rows.items.len > 0) {
+        const last = &rows.items[rows.items.len - 1];
+        if (last.end) |end| {
+            if ((try zdt.Datetime.compareUT(end, now)) == .eq) last.end = null;
+        }
+    }
+
+    return rows.toOwnedSlice(allocator);
 }
 
 /// Parse a --start/--end argument.
@@ -584,6 +720,128 @@ test "analyze: outage straddling the window start is counted" {
     const result = try analyze(events, start, end, testThreshold(), null);
     try std.testing.expectEqual(@as(u32, 1), result.outage_count);
     try std.testing.expectEqual(@as(i128, 20 * 60 * std.time.ns_per_s), result.down_time.asNanoseconds());
+}
+
+test "analyze and outagesFromSegments agree across an unknown gap" {
+    // a down run, then an unobserved gap whose only up event carries a
+    // zero-length interval, then down again: one outage either way
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T10:00:00Z", false));
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T11:00:00Z", true));
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T11:00:00Z", false));
+    try events.append(std.testing.allocator, try testEvent("2026-08-16T11:30:00Z", true));
+
+    const result = try analyze(events, null, null, testThreshold(), null);
+    try std.testing.expectEqual(@as(u32, 1), result.outage_count);
+
+    const segs = try buildSegments(
+        std.testing.allocator,
+        events.items,
+        result.window_start,
+        result.window_end,
+        testThreshold(),
+    );
+    defer std.testing.allocator.free(segs);
+    const rows = try outagesFromSegments(std.testing.allocator, segs, result.window_end);
+    defer std.testing.allocator.free(rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i128, 65 * 60 * std.time.ns_per_s), rows[0].dur.asNanoseconds());
+}
+
+test "buildSegments: gaps, transitions and trust horizon" {
+    const ws = try testTs("2026-09-24T00:00:00Z");
+    const we = try testTs("2026-09-25T00:00:00Z");
+    const events = [_]Event{
+        try testEvent("2026-09-23T23:00:00Z", true), // before the window: no coverage
+        try testEvent("2026-09-23T23:50:00Z", true), // trusted to 00:25
+        try testEvent("2026-09-24T01:00:00Z", false), // outage start
+        try testEvent("2026-09-24T01:30:00Z", true), // outage end
+        try testEvent("2026-09-24T02:00:00Z", true), // heartbeat, trusted to 02:35
+    };
+
+    const segs = try buildSegments(std.testing.allocator, &events, ws, we, testThreshold());
+    defer std.testing.allocator.free(segs);
+
+    try std.testing.expectEqual(@as(usize, 5), segs.len);
+    try std.testing.expectEqual(SegState.up, segs[0].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T00:00:00Z"), segs[0].start);
+    try std.testing.expectEqual(try testTs("2026-09-24T00:25:00Z"), segs[0].end);
+    try std.testing.expectEqual(SegState.unknown, segs[1].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T01:00:00Z"), segs[1].end);
+    try std.testing.expectEqual(SegState.down, segs[2].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T01:30:00Z"), segs[2].end);
+    try std.testing.expectEqual(SegState.up, segs[3].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T02:35:00Z"), segs[3].end);
+    try std.testing.expectEqual(SegState.unknown, segs[4].state);
+    try std.testing.expectEqual(we, segs[4].end);
+}
+
+test "buildSegments: outage straddling the window start" {
+    const ws = try testTs("2026-09-24T00:00:00Z");
+    const we = try testTs("2026-09-25T00:00:00Z");
+    const events = [_]Event{
+        try testEvent("2026-09-23T23:50:00Z", false), // down before the window, trusted to 00:25
+        try testEvent("2026-09-24T01:00:00Z", true),
+    };
+
+    const segs = try buildSegments(std.testing.allocator, &events, ws, we, testThreshold());
+    defer std.testing.allocator.free(segs);
+
+    // down coverage clamps to the window start and ends at the trust horizon
+    try std.testing.expectEqual(@as(usize, 4), segs.len);
+    try std.testing.expectEqual(SegState.down, segs[0].state);
+    try std.testing.expectEqual(ws, segs[0].start);
+    try std.testing.expectEqual(try testTs("2026-09-24T00:25:00Z"), segs[0].end);
+    try std.testing.expectEqual(SegState.unknown, segs[1].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T01:00:00Z"), segs[1].end);
+    try std.testing.expectEqual(SegState.up, segs[2].state);
+    try std.testing.expectEqual(try testTs("2026-09-24T01:35:00Z"), segs[2].end);
+    try std.testing.expectEqual(SegState.unknown, segs[3].state);
+    try std.testing.expectEqual(we, segs[3].end);
+}
+
+test "buildSegments: empty window is all unknown" {
+    const ws = try testTs("2026-09-24T00:00:00Z");
+    const we = try testTs("2026-09-25T00:00:00Z");
+    const segs = try buildSegments(std.testing.allocator, &.{}, ws, we, testThreshold());
+    defer std.testing.allocator.free(segs);
+    try std.testing.expectEqual(@as(usize, 1), segs.len);
+    try std.testing.expectEqual(SegState.unknown, segs[0].state);
+    try std.testing.expectEqual(ws, segs[0].start);
+    try std.testing.expectEqual(we, segs[0].end);
+}
+
+test "outagesFromSegments: completed, ongoing, and straddling" {
+    const ws = try testTs("2026-09-24T00:00:00Z");
+    const we = try testTs("2026-09-25T00:00:00Z");
+
+    const segs = [_]Segment{
+        .{ .state = .down, .start = ws, .end = try testTs("2026-09-24T01:00:00Z") }, // straddling start
+        .{ .state = .up, .start = try testTs("2026-09-24T01:00:00Z"), .end = try testTs("2026-09-24T12:00:00Z") },
+        .{ .state = .down, .start = try testTs("2026-09-24T12:00:00Z"), .end = try testTs("2026-09-24T12:10:00Z") },
+        .{ .state = .up, .start = try testTs("2026-09-24T12:10:00Z"), .end = we },
+    };
+    const rows = try outagesFromSegments(std.testing.allocator, &segs, we);
+    defer std.testing.allocator.free(rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    // rows are chronological: the straddler first, the noon outage second
+    try std.testing.expectEqual(ws, rows[0].start);
+    try std.testing.expectEqual(try testTs("2026-09-24T01:00:00Z"), rows[0].end.?);
+    try std.testing.expectEqual(try testTs("2026-09-24T12:00:00Z"), rows[1].start);
+    try std.testing.expectEqual(try testTs("2026-09-24T12:10:00Z"), rows[1].end.?);
+    try std.testing.expectEqual(@as(i128, 600 * std.time.ns_per_s), rows[1].dur.asNanoseconds());
+
+    // a down run reaching `now` is ongoing
+    const ongoing = [_]Segment{
+        .{ .state = .down, .start = try testTs("2026-09-24T23:00:00Z"), .end = we },
+    };
+    const rows2 = try outagesFromSegments(std.testing.allocator, &ongoing, we);
+    defer std.testing.allocator.free(rows2);
+    try std.testing.expectEqual(@as(usize, 1), rows2.len);
+    try std.testing.expect(rows2[0].end == null);
 }
 
 fn testTs(ts: []const u8) !zdt.Datetime {

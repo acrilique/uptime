@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Internet uptime</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+<script type="module" src="/datastar.js"></script>
+</head>
+<body data-init="@get('/events?window={s}', {{openWhenHidden: true}})">
+<main>
+<h1>Internet uptime</h1>
+{s}
+<nav class="tabs" aria-label="Time window">
+<a href="/?window=24h" class="{s}">24 h</a>
+<a href="/?window=7d" class="{s}">7 days</a>
+<a href="/?window=30d" class="{s}">30 days</a>
+</nav>
+{s}
+{s}
+{s}
+{s}
+</main>
+</body>
+</html>

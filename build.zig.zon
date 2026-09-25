@@ -40,6 +40,10 @@
             .url = "https://codeberg.org/FObersteiner/zdt/archive/v0.9.8.tar.gz",
             .hash = "zdt-0.9.8-xr0_vHrgEQA6h5_VpXPw5RPuNuks48Ukws5kB0vX0Nys",
         },
+        .datastar = .{
+            .url = "git+https://github.com/starfederation/datastar-zig#1f8529d286db70963560d9e7fb680be1b84837c5",
+            .hash = "datastar_sdk_zig-0.1.0-IRNEdhNOAAAqlQb7oJWLU9KnorucKkrZ3H3UFurQzUxs",
+        },
     },
     .paths = .{
         "build.zig",
