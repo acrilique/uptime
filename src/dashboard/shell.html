@@ -8,7 +8,10 @@
 <link rel="stylesheet" href="/style.css">
 <script type="module" src="/datastar.js"></script>
 </head>
-<body data-init="@get('/events?window={s}', {{openWhenHidden: true}})">
+<body
+  data-signals="{{win: '{s}'}}"
+  data-effect="window.__uptimeSse?.abort(); window.__uptimeSse = new AbortController(); @get('/events?window=' + $win, {{requestCancellation: window.__uptimeSse}})"
+>
 <main>
 {s}
 {s}

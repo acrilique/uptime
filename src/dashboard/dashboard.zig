@@ -518,14 +518,23 @@ fn tabCls(current: Window, tab: Window) []const u8 {
 
 /// The window tabs; `base` ("/" or "/outages") keeps them on the current
 /// surface.
-fn renderTabs(arena: std.mem.Allocator, base: []const u8, current: Window) ![]const u8 {
+fn renderTabs(arena: std.mem.Allocator, base: []const u8, current: Window, live: bool) ![]const u8 {
     var buf: Io.Writer.Allocating = .init(arena);
     const w = &buf.writer;
     try w.writeAll("<nav class=\"tabs\" aria-label=\"Time window\">");
     for (window_specs, 0..) |spec, i| {
-        try w.print("<a href=\"{s}?window={s}\" class=\"{s}\">{s}</a>", .{
-            base, spec.id, tabCls(current, @enumFromInt(i)), spec.tab,
-        });
+        if (live) {
+            try w.print(
+                "<a href=\"/?window={s}\" class=\"{s}\"" ++
+                    " data-on:click=\"evt.preventDefault(); $win = '{s}'; history.replaceState(null, '', '/?window={s}')\"" ++
+                    " data-attr:class=\"$win === '{s}' ? 'active' : ''\">{s}</a>",
+                .{ spec.id, tabCls(current, @enumFromInt(i)), spec.id, spec.id, spec.id, spec.tab },
+            );
+        } else {
+            try w.print("<a href=\"{s}?window={s}\" class=\"{s}\">{s}</a>", .{
+                base, spec.id, tabCls(current, @enumFromInt(i)), spec.tab,
+            });
+        }
     }
     try w.writeAll("</nav>");
     return buf.written();
@@ -543,7 +552,7 @@ fn renderPage(
     const timeline = try renderTimeline(arena, snap, tz);
     const outages = try renderOutageTeaser(arena, snap, tz);
     const generated = try wrapGenerated(arena, try renderGenerated(arena, now, tz, refresh_s));
-    const tabs = try renderTabs(arena, "/", snap.window);
+    const tabs = try renderTabs(arena, "/", snap.window, true);
 
     return std.fmt.allocPrint(arena, shell_tpl, .{
         windowSpec(snap.window).id, // <body data-init> SSE bootstrap, first {s} in the shell
@@ -566,7 +575,7 @@ fn renderArchive(arena: std.mem.Allocator, snap: Snapshot, tz: *const zdt.Timezo
     );
     return std.fmt.allocPrint(arena, archive_tpl, .{
         head.written(),
-        try renderTabs(arena, "/outages", snap.window),
+        try renderTabs(arena, "/outages", snap.window, false),
         try renderOutages(arena, snap, tz),
     });
 }
@@ -1237,9 +1246,22 @@ test "renderPage: shell wires fragments, tabs and the SSE bootstrap" {
     };
     const html = try renderPage(arena, snap, &zdt.Timezone.UTC, 30, dt("2026-09-25T00:00:00Z"));
 
+    // guards the placeholder order: the window seed must stay the first {s}
+    // in the shell and land inside the body's initial signals; the full
+    // opening tag catches dropped quotes in the fmt template's braces
+    try testing.expect(
+        std.mem.indexOf(u8, html, "<body\n  data-signals=\"{win: '7d'}\"\n  data-effect=") != null,
+    );
+    // the SSE stream is owned by one effect keyed on the win signal, so tab
+    // clicks restart it without a navigation
+    try testing.expect(std.mem.indexOf(u8, html, "@get('/events?window=' + $win") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "requestCancellation: window.__uptimeSse") != null);
+    // live tabs switch the signal instead of navigating; href stays as the
+    // no-JS fallback and the URL is rewritten in place
+    try testing.expect(
+        std.mem.indexOf(u8, html, "$win = '7d'; history.replaceState(null, '', '/?window=7d')") != null,
+    );
     try testing.expect(std.mem.indexOf(u8, html, "class=\"active\"") != null);
-    // guards the placeholder order: the body bootstrap must stay intact
-    try testing.expect(std.mem.indexOf(u8, html, "<body data-init=\"@get('/events?window=7d', {openWhenHidden: true})\">") != null);
     try testing.expect(std.mem.indexOf(u8, html, "<div id=\"hero\"") != null);
     try testing.expect(std.mem.indexOf(u8, html, "Last 7 days") != null);
 }
